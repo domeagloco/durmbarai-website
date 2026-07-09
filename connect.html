@@ -1,1 +1,88 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Connect Facebook Page - Durmbar AI</title>
+  <style>
+    body { font-family: Arial, sans-serif; background:#0f172a; margin:0; color:#111827; }
+    .box { max-width:800px; margin:50px auto; background:white; padding:32px; border-radius:18px; }
+    button { background:#1877f2; color:white; border:0; padding:12px 18px; border-radius:8px; cursor:pointer; font-size:16px; }
+    .page { border:1px solid #e5e7eb; padding:14px; border-radius:10px; margin-top:12px; }
+    .muted { color:#6b7280; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>เชื่อมต่อ Facebook Page กับ Durmbar AI</h1>
+    <p>
+      หน้านี้ใช้สำหรับให้ผู้ดูแลเพจ Facebook เข้าสู่ระบบ และเลือกเพจที่ต้องการเชื่อมต่อกับ Durmbar AI
+      เพื่อใช้งานระบบตอบข้อความลูกค้าผ่าน Messenger
+    </p>
 
+    <button onclick="loginWithFacebook()">เชื่อมต่อ Facebook</button>
+
+    <h2>รายการเพจที่คุณจัดการ</h2>
+    <div id="pages" class="muted">กรุณาเชื่อมต่อ Facebook เพื่อดูรายการเพจ</div>
+  </div>
+
+  <script>
+    window.fbAsyncInit = function() {
+      FB.init({
+        appId: '2204640160434198',
+        cookie: true,
+        xfbml: true,
+        version: 'v23.0'
+      });
+    };
+
+    function loginWithFacebook() {
+      FB.login(function(response) {
+        if (response.authResponse) {
+          loadPages();
+        } else {
+          document.getElementById('pages').innerHTML = 'ยังไม่ได้อนุญาตการเชื่อมต่อ Facebook';
+        }
+      }, {
+        scope: 'pages_show_list,pages_manage_metadata,pages_messaging'
+      });
+    }
+
+    function loadPages() {
+      FB.api('/me/accounts', function(response) {
+        const pagesBox = document.getElementById('pages');
+
+        if (!response || response.error) {
+          pagesBox.innerHTML = 'ไม่สามารถโหลดรายการเพจได้ กรุณาตรวจสอบสิทธิ์ของแอป';
+          return;
+        }
+
+        if (!response.data || response.data.length === 0) {
+          pagesBox.innerHTML = 'ไม่พบเพจที่บัญชีนี้จัดการ';
+          return;
+        }
+
+        pagesBox.innerHTML = '';
+
+        response.data.forEach(function(page) {
+          const div = document.createElement('div');
+          div.className = 'page';
+          div.innerHTML = `
+            <strong>${page.name}</strong><br>
+            <span class="muted">Page ID: ${page.id}</span><br><br>
+            <button onclick="selectPage('${page.id}', '${page.name}')">เลือกเพจนี้</button>
+          `;
+          pagesBox.appendChild(div);
+        });
+      });
+    }
+
+    function selectPage(pageId, pageName) {
+      alert('เชื่อมต่อเพจ "' + pageName + '" กับ Durmbar AI แล้ว');
+    }
+  </script>
+
+  <script async defer crossorigin="anonymous"
+    src="https://connect.facebook.net/th_TH/sdk.js"></script>
+</body>
+</html>
