@@ -197,6 +197,10 @@
   <script>
     const ADMIN_API_URL =
       'https://domeagloco.app.n8n.cloud/webhook/durmbar-admin-pages';
+    const SUBSCRIBE_API_URL =
+  'https://domeagloco.app.n8n.cloud/webhook/durmbar-admin-subscribe';
+
+let currentUserAccessToken = null;
 
     const statusBox = document.getElementById('status');
     const pagesBox = document.getElementById('pages');
@@ -253,10 +257,10 @@
             return;
           }
 
-          const userAccessToken =
-            response.authResponse.accessToken;
+          currentUserAccessToken =
+  response.authResponse.accessToken;
 
-          loadManagedPages(userAccessToken);
+loadManagedPages(currentUserAccessToken);
         },
         {
           scope:
@@ -400,29 +404,112 @@
       });
     }
 
-    function selectPage(page, selectedCard) {
-      document
-        .querySelectorAll('.page')
-        .forEach(function (card) {
-          card.classList.remove('selected');
-        });
+    async function selectPage(page, selectedCard) {
+  if (!currentUserAccessToken) {
+    setStatus(
+      'ไม่พบข้อมูล Facebook Login กรุณาเชื่อมต่อ Facebook ใหม่',
+      'error'
+    );
+    return;
+  }
 
-      selectedCard.classList.add('selected');
+  const selectButton =
+    selectedCard.querySelector('.select-button');
 
-      sessionStorage.setItem(
-        'durmbar_selected_page',
-        JSON.stringify({
-          id: page.id,
-          name: page.name
-        })
-      );
+  document
+    .querySelectorAll('.select-button')
+    .forEach(function (button) {
+      button.disabled = true;
+    });
 
-      setStatus(
-        'เลือกเพจ "' + page.name +
-        '" แล้ว ขั้นต่อไปคือเชื่อม Webhook ของเพจ',
-        'success'
+  selectButton.textContent = 'กำลังเชื่อมต่อ...';
+
+  setStatus(
+    'กำลังเชื่อม Webhook ของเพจ "' + page.name + '"...',
+    'loading'
+  );
+
+  try {
+    const response = await fetch(SUBSCRIBE_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        page_id: page.id,
+        access_token: currentUserAccessToken
+      })
+    });
+
+    const responseText = await response.text();
+
+    let result;
+
+    try {
+      result = JSON.parse(responseText);
+    } catch (error) {
+      throw new Error('API ไม่ได้ตอบกลับมาเป็น JSON');
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        result.message ||
+        result.error ||
+        'API ตอบกลับด้วยข้อผิดพลาด'
       );
     }
+
+    if (!result.success || !result.connected) {
+      throw new Error(
+        result.message ||
+        'Meta ยังไม่ได้ยืนยันการเชื่อมต่อ Webhook'
+      );
+    }
+
+    document
+      .querySelectorAll('.page')
+      .forEach(function (card) {
+        card.classList.remove('selected');
+      });
+
+    selectedCard.classList.add('selected');
+
+    sessionStorage.setItem(
+      'durmbar_selected_page',
+      JSON.stringify({
+        id: result.page_id || page.id,
+        name: result.page_name || page.name,
+        connected: true
+      })
+    );
+
+    selectButton.textContent = 'เชื่อมต่อแล้ว';
+
+    setStatus(
+      'เชื่อมเพจ "' +
+      (result.page_name || page.name) +
+      '" กับ Webhook สำเร็จ',
+      'success'
+    );
+  } catch (error) {
+    console.error('Subscribe page error:', error);
+
+    selectButton.textContent = 'เลือกเพจนี้';
+
+    setStatus(
+      'เชื่อม Webhook ไม่สำเร็จ: ' + error.message,
+      'error'
+    );
+  } finally {
+    document
+      .querySelectorAll('.select-button')
+      .forEach(function (button) {
+        if (button.textContent !== 'เชื่อมต่อแล้ว') {
+          button.disabled = false;
+        }
+      });
+  }
+}
   </script>
 
   <script
