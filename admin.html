@@ -270,7 +270,42 @@
   font-size: 11px;
   opacity: 0.7;
 }
+.message-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 14px;
+  border-top: 1px solid #e2e8f0;
+  background: #ffffff;
+}
 
+.message-composer textarea {
+  flex: 1;
+  min-height: 46px;
+  max-height: 140px;
+  padding: 11px 13px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+}
+
+.message-composer textarea:focus {
+  border-color: #1877f2;
+  box-shadow: 0 0 0 3px rgba(24, 119, 242, 0.12);
+}
+
+.send-message-button {
+  min-width: 92px;
+  background: #1877f2;
+  color: #ffffff;
+}
+
+.send-message-button:disabled {
+  background: #94a3b8;
+}
 @media (max-width: 700px) {
   .inbox {
     grid-template-columns: 1fr;
@@ -359,6 +394,25 @@
           เลือกลูกค้าทางด้านซ้ายเพื่อดูข้อความ
         </div>
       </div>
+      <div class="message-composer">
+  <textarea
+    id="messageInput"
+    rows="2"
+    maxlength="2000"
+    placeholder="พิมพ์ข้อความตอบลูกค้า..."
+    aria-label="ข้อความตอบลูกค้า"
+  ></textarea>
+
+  <button
+    id="sendMessageButton"
+    class="send-message-button"
+    type="button"
+    onclick="sendMessage()"
+    disabled
+  >
+    ส่งข้อความ
+  </button>
+</div>
     </div>
   </div>
 </div>
@@ -373,6 +427,8 @@
 
 const CONVERSATIONS_API_URL =
   'https://domeagloco.app.n8n.cloud/webhook/durmbar-admin-conversations';
+    const SEND_MESSAGE_API_URL =
+  'https://domeagloco.app.n8n.cloud/webhook/durmbar-admin-send-message';
 
 let currentUserAccessToken = null;
 let currentSelectedPage = null;
@@ -399,6 +455,11 @@ const messagesBox =
 
 const refreshInboxButton =
   document.getElementById('refreshInboxButton');
+    const messageInput =
+  document.getElementById('messageInput');
+
+const sendMessageButton =
+  document.getElementById('sendMessageButton');
 
     window.fbAsyncInit = function () {
       FB.init({
@@ -896,6 +957,7 @@ function openConversation(conversationId) {
   }
 
   currentConversationId = conversation.conversation_id;
+  sendMessageButton.disabled = false;
 
   document
     .querySelectorAll('.conversation-item')
@@ -970,6 +1032,136 @@ function formatMessageTime(dateValue) {
     dateStyle: 'short',
     timeStyle: 'short'
   }).format(date);
+}
+    async function sendMessage() {
+  if (!currentUserAccessToken) {
+    inboxStatus.textContent =
+      'ไม่พบข้อมูล Facebook Login กรุณาเชื่อมต่อ Facebook ใหม่';
+
+    inboxStatus.className = 'status error';
+    return;
+  }
+
+  if (!currentSelectedPage || !currentSelectedPage.id) {
+    inboxStatus.textContent =
+      'กรุณาเลือกและเชื่อมต่อเพจก่อนส่งข้อความ';
+
+    inboxStatus.className = 'status error';
+    return;
+  }
+
+  const conversation = currentConversations.find(
+    function (item) {
+      return String(item.conversation_id) ===
+        String(currentConversationId);
+    }
+  );
+
+  if (!conversation) {
+    inboxStatus.textContent =
+      'กรุณาเลือกบทสนทนาที่ต้องการตอบ';
+
+    inboxStatus.className = 'status error';
+    return;
+  }
+
+  const recipientId =
+    conversation.customer &&
+    conversation.customer.id
+      ? conversation.customer.id
+      : '';
+
+  if (!recipientId) {
+    inboxStatus.textContent =
+      'ไม่พบ Recipient ID ของลูกค้ารายนี้';
+
+    inboxStatus.className = 'status error';
+    return;
+  }
+
+  const messageText = messageInput.value.trim();
+
+  if (!messageText) {
+    inboxStatus.textContent =
+      'กรุณาพิมพ์ข้อความก่อนกดส่ง';
+
+    inboxStatus.className = 'status error';
+    messageInput.focus();
+    return;
+  }
+
+  sendMessageButton.disabled = true;
+  messageInput.disabled = true;
+  sendMessageButton.textContent = 'กำลังส่ง...';
+
+  inboxStatus.textContent =
+    'กำลังส่งข้อความถึงลูกค้า...';
+
+  inboxStatus.className = 'status loading';
+
+  try {
+    const response = await fetch(SEND_MESSAGE_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        page_id: currentSelectedPage.id,
+        recipient_id: recipientId,
+        message: messageText,
+        access_token: currentUserAccessToken
+      })
+    });
+
+    const responseText = await response.text();
+
+    let result;
+
+    try {
+      result = JSON.parse(responseText);
+    } catch (error) {
+      throw new Error('API ไม่ได้ตอบกลับมาเป็น JSON');
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        result.message ||
+        result.error ||
+        'API ตอบกลับด้วยข้อผิดพลาด'
+      );
+    }
+
+    if (!result.success || !result.sent) {
+      throw new Error(
+        result.message ||
+        'Meta ยังไม่ได้ยืนยันการส่งข้อความ'
+      );
+    }
+
+    messageInput.value = '';
+
+    inboxStatus.textContent =
+      'ส่งข้อความสำเร็จ';
+
+    inboxStatus.className = 'status success';
+
+    await loadConversations();
+  } catch (error) {
+    console.error('Send message error:', error);
+
+    inboxStatus.textContent =
+      'ส่งข้อความไม่สำเร็จ: ' + error.message;
+
+    inboxStatus.className = 'status error';
+  } finally {
+    messageInput.disabled = false;
+
+    sendMessageButton.disabled =
+      !currentConversationId;
+
+    sendMessageButton.textContent = 'ส่งข้อความ';
+    messageInput.focus();
+  }
 }
   </script>
 
