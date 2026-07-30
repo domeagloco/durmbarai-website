@@ -149,6 +149,139 @@
       text-align: center;
     }
 
+    .inbox-section {
+  display: none;
+  margin-top: 32px;
+  padding-top: 28px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.inbox-section.visible {
+  display: block;
+}
+
+.inbox-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.refresh-button {
+  background: #e2e8f0;
+  color: #0f172a;
+  padding: 10px 14px;
+  font-size: 14px;
+}
+
+.inbox {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  min-height: 480px;
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+}
+
+.conversation-list {
+  border-right: 1px solid #e2e8f0;
+  background: #f8fafc;
+  overflow-y: auto;
+}
+
+.conversation-item {
+  width: 100%;
+  padding: 16px;
+  border: 0;
+  border-bottom: 1px solid #e2e8f0;
+  border-radius: 0;
+  background: transparent;
+  color: #0f172a;
+  text-align: left;
+}
+
+.conversation-item:hover,
+.conversation-item.active {
+  background: #e0e7ff;
+}
+
+.conversation-name {
+  margin-bottom: 5px;
+  font-weight: 700;
+}
+
+.conversation-preview {
+  color: #64748b;
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: #ffffff;
+}
+
+.chat-header {
+  padding: 16px;
+  border-bottom: 1px solid #e2e8f0;
+  font-weight: 700;
+}
+
+.messages {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 360px;
+  max-height: 520px;
+  padding: 18px;
+  overflow-y: auto;
+  background: #f8fafc;
+}
+
+.message {
+  max-width: 78%;
+  padding: 10px 13px;
+  border-radius: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.message.incoming {
+  align-self: flex-start;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+}
+
+.message.outgoing {
+  align-self: flex-end;
+  background: #1877f2;
+  color: #ffffff;
+}
+
+.message-time {
+  display: block;
+  margin-top: 5px;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+@media (max-width: 700px) {
+  .inbox {
+    grid-template-columns: 1fr;
+  }
+
+  .conversation-list {
+    max-height: 220px;
+    border-right: 0;
+    border-bottom: 1px solid #e2e8f0;
+  }
+}
     @media (max-width: 600px) {
       .card {
         padding: 22px;
@@ -191,6 +324,44 @@
           กรุณาเชื่อมต่อ Facebook เพื่อดูรายการเพจ
         </div>
       </div>
+      <div id="inboxSection" class="inbox-section">
+  <div class="inbox-toolbar">
+    <h2 style="margin: 0;">กล่องข้อความ Messenger</h2>
+
+    <button
+      id="refreshInboxButton"
+      class="refresh-button"
+      type="button"
+      onclick="loadConversations()"
+    >
+      โหลดข้อความใหม่
+    </button>
+  </div>
+
+  <div id="inboxStatus" class="status">
+    เลือกและเชื่อมต่อเพจก่อนเปิดกล่องข้อความ
+  </div>
+
+  <div class="inbox">
+    <div id="conversationList" class="conversation-list">
+      <div class="empty">
+        ยังไม่มีรายการสนทนา
+      </div>
+    </div>
+
+    <div class="chat-panel">
+      <div id="chatHeader" class="chat-header">
+        เลือกรายการสนทนา
+      </div>
+
+      <div id="messages" class="messages">
+        <div class="empty">
+          เลือกลูกค้าทางด้านซ้ายเพื่อดูข้อความ
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
     </section>
   </main>
 
@@ -200,11 +371,34 @@
     const SUBSCRIBE_API_URL =
   'https://domeagloco.app.n8n.cloud/webhook/durmbar-admin-subscribe';
 
+const CONVERSATIONS_API_URL =
+  'https://domeagloco.app.n8n.cloud/webhook/durmbar-admin-conversations';
+
 let currentUserAccessToken = null;
+let currentSelectedPage = null;
+let currentConversations = [];
+let currentConversationId = null;
 
     const statusBox = document.getElementById('status');
     const pagesBox = document.getElementById('pages');
     const loginButton = document.getElementById('loginButton');
+    const inboxSection =
+  document.getElementById('inboxSection');
+
+const inboxStatus =
+  document.getElementById('inboxStatus');
+
+const conversationList =
+  document.getElementById('conversationList');
+
+const chatHeader =
+  document.getElementById('chatHeader');
+
+const messagesBox =
+  document.getElementById('messages');
+
+const refreshInboxButton =
+  document.getElementById('refreshInboxButton');
 
     window.fbAsyncInit = function () {
       FB.init({
@@ -474,23 +668,36 @@ loadManagedPages(currentUserAccessToken);
 
     selectedCard.classList.add('selected');
 
-    sessionStorage.setItem(
-      'durmbar_selected_page',
-      JSON.stringify({
-        id: result.page_id || page.id,
-        name: result.page_name || page.name,
-        connected: true
-      })
-    );
+    currentSelectedPage = {
+  id: result.page_id || page.id,
+  name: result.page_name || page.name,
+  connected: true
+};
 
-    selectButton.textContent = 'เชื่อมต่อแล้ว';
+sessionStorage.setItem(
+  'durmbar_selected_page',
+  JSON.stringify(currentSelectedPage)
+);
 
-    setStatus(
-      'เชื่อมเพจ "' +
-      (result.page_name || page.name) +
-      '" กับ Webhook สำเร็จ',
-      'success'
-    );
+selectButton.textContent = 'เชื่อมต่อแล้ว';
+
+setStatus(
+  'เชื่อมเพจ "' +
+  currentSelectedPage.name +
+  '" กับ Webhook สำเร็จ',
+  'success'
+);
+
+inboxSection.classList.add('visible');
+
+inboxStatus.textContent =
+  'กำลังโหลดบทสนทนาของเพจ "' +
+  currentSelectedPage.name +
+  '"...';
+
+inboxStatus.className = 'status loading';
+
+await loadConversations();
   } catch (error) {
     console.error('Subscribe page error:', error);
 
@@ -509,6 +716,260 @@ loadManagedPages(currentUserAccessToken);
         }
       });
   }
+}
+    async function loadConversations() {
+  if (!currentUserAccessToken) {
+    inboxStatus.textContent =
+      'ไม่พบข้อมูล Facebook Login กรุณาเชื่อมต่อ Facebook ใหม่';
+
+    inboxStatus.className = 'status error';
+    return;
+  }
+
+  if (!currentSelectedPage || !currentSelectedPage.id) {
+    inboxStatus.textContent =
+      'กรุณาเลือกและเชื่อมต่อเพจก่อนโหลดข้อความ';
+
+    inboxStatus.className = 'status error';
+    return;
+  }
+
+  refreshInboxButton.disabled = true;
+  refreshInboxButton.textContent = 'กำลังโหลด...';
+
+  inboxStatus.textContent =
+    'กำลังโหลดบทสนทนาของเพจ "' +
+    currentSelectedPage.name +
+    '"...';
+
+  inboxStatus.className = 'status loading';
+
+  conversationList.innerHTML =
+    '<div class="empty">กำลังโหลดรายการสนทนา...</div>';
+
+  try {
+    const response = await fetch(CONVERSATIONS_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        page_id: currentSelectedPage.id,
+        access_token: currentUserAccessToken
+      })
+    });
+
+    const responseText = await response.text();
+
+    let result;
+
+    try {
+      result = JSON.parse(responseText);
+    } catch (error) {
+      throw new Error('API ไม่ได้ตอบกลับมาเป็น JSON');
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        result.message ||
+        result.error ||
+        'API ตอบกลับด้วยข้อผิดพลาด'
+      );
+    }
+
+    if (!result.success) {
+      throw new Error(
+        result.message ||
+        'ไม่สามารถโหลดบทสนทนาได้'
+      );
+    }
+
+    currentConversations = Array.isArray(result.conversations)
+      ? result.conversations
+      : [];
+
+    renderConversationList();
+
+    inboxStatus.textContent =
+      'โหลดบทสนทนาสำเร็จ ' +
+      currentConversations.length +
+      ' รายการ';
+
+    inboxStatus.className = 'status success';
+  } catch (error) {
+    console.error('Load conversations error:', error);
+
+    currentConversations = [];
+    currentConversationId = null;
+
+    inboxStatus.textContent =
+      'โหลดบทสนทนาไม่สำเร็จ: ' + error.message;
+
+    inboxStatus.className = 'status error';
+
+    conversationList.innerHTML =
+      '<div class="empty">ไม่สามารถแสดงรายการสนทนาได้</div>';
+
+    chatHeader.textContent = 'เลือกรายการสนทนา';
+
+    messagesBox.innerHTML =
+      '<div class="empty">ยังไม่มีข้อความให้แสดง</div>';
+  } finally {
+    refreshInboxButton.disabled = false;
+    refreshInboxButton.textContent = 'โหลดข้อความใหม่';
+  }
+}
+
+function renderConversationList() {
+  conversationList.innerHTML = '';
+
+  if (currentConversations.length === 0) {
+    conversationList.innerHTML =
+      '<div class="empty">ยังไม่พบบทสนทนา Messenger</div>';
+
+    chatHeader.textContent = 'ยังไม่มีบทสนทนา';
+
+    messagesBox.innerHTML =
+      '<div class="empty">เมื่อมีลูกค้าส่งข้อความ รายการจะแสดงตรงนี้</div>';
+
+    return;
+  }
+
+  currentConversations.forEach(function (conversation) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'conversation-item';
+
+    button.dataset.conversationId =
+      conversation.conversation_id || '';
+
+    const customerName =
+      conversation.customer &&
+      conversation.customer.name
+        ? conversation.customer.name
+        : 'ลูกค้า';
+
+    const latestText =
+      conversation.latest_message &&
+      conversation.latest_message.text
+        ? conversation.latest_message.text
+        : 'ยังไม่มีข้อความ';
+
+    const nameBox = document.createElement('div');
+    nameBox.className = 'conversation-name';
+    nameBox.textContent = customerName;
+
+    const previewBox = document.createElement('div');
+    previewBox.className = 'conversation-preview';
+    previewBox.textContent = latestText;
+
+    button.appendChild(nameBox);
+    button.appendChild(previewBox);
+
+    button.addEventListener('click', function () {
+      openConversation(conversation.conversation_id);
+    });
+
+    conversationList.appendChild(button);
+  });
+
+  openConversation(
+    currentConversationId ||
+    currentConversations[0].conversation_id
+  );
+}
+function openConversation(conversationId) {
+  const conversation = currentConversations.find(
+    function (item) {
+      return String(item.conversation_id) ===
+        String(conversationId);
+    }
+  );
+
+  if (!conversation) {
+    chatHeader.textContent = 'ไม่พบบทสนทนา';
+
+    messagesBox.innerHTML =
+      '<div class="empty">ไม่พบข้อมูลบทสนทนาที่เลือก</div>';
+
+    return;
+  }
+
+  currentConversationId = conversation.conversation_id;
+
+  document
+    .querySelectorAll('.conversation-item')
+    .forEach(function (button) {
+      const isActive =
+        String(button.dataset.conversationId) ===
+        String(currentConversationId);
+
+      button.classList.toggle('active', isActive);
+    });
+
+  const customerName =
+    conversation.customer &&
+    conversation.customer.name
+      ? conversation.customer.name
+      : 'ลูกค้า';
+
+  chatHeader.textContent = customerName;
+  messagesBox.innerHTML = '';
+
+  const messages = Array.isArray(conversation.messages)
+    ? conversation.messages
+    : [];
+
+  if (messages.length === 0) {
+    messagesBox.innerHTML =
+      '<div class="empty">ยังไม่มีข้อความในบทสนทนานี้</div>';
+
+    return;
+  }
+
+  messages.forEach(function (message) {
+    const messageBox = document.createElement('div');
+
+    messageBox.className =
+      'message ' +
+      (message.direction === 'outgoing'
+        ? 'outgoing'
+        : 'incoming');
+
+    const messageText = document.createElement('div');
+
+    messageText.textContent =
+      message.text || '[ข้อความที่ไม่มีตัวอักษร]';
+
+    const messageTime = document.createElement('span');
+    messageTime.className = 'message-time';
+
+    messageTime.textContent =
+      formatMessageTime(message.created_time);
+
+    messageBox.appendChild(messageText);
+    messageBox.appendChild(messageTime);
+    messagesBox.appendChild(messageBox);
+  });
+
+  messagesBox.scrollTop = messagesBox.scrollHeight;
+}
+
+function formatMessageTime(dateValue) {
+  if (!dateValue) {
+    return '';
+  }
+
+  const date = new Date(dateValue);
+
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+
+  return new Intl.DateTimeFormat('th-TH', {
+    dateStyle: 'short',
+    timeStyle: 'short'
+  }).format(date);
 }
   </script>
 
