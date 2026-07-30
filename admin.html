@@ -352,7 +352,7 @@
         เชื่อมต่อ Facebook
       </button>
 
-      <h2>เพจที่คุณจัดการ</h2>
+      <h2 id="pagesHeading">เพจที่คุณจัดการ</h2>
 
       <div id="pages" class="pages">
         <div class="empty">
@@ -437,6 +437,8 @@ let currentConversationId = null;
 
     const statusBox = document.getElementById('status');
     const pagesBox = document.getElementById('pages');
+    const pagesHeading =
+  document.getElementById('pagesHeading');
     const loginButton = document.getElementById('loginButton');
     const inboxSection =
   document.getElementById('inboxSection');
@@ -750,6 +752,13 @@ setStatus(
 );
 
 inboxSection.classList.add('visible');
+    pagesHeading.style.display = 'none';
+pagesBox.style.display = 'none';
+
+inboxSection.scrollIntoView({
+  behavior: 'smooth',
+  block: 'start'
+});
 
 inboxStatus.textContent =
   'กำลังโหลดบทสนทนาของเพจ "' +
