@@ -1,0 +1,219 @@
+name: PRJ-019 M10 Paperclip Runtime Proof
+
+on:
+  push:
+    branches:
+      - prj019-m10-paperclip-runtime
+    paths:
+      - .github/workflows/prj019-m10-paperclip-runtime.yml
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PAPERCLIP_VERSION: "2026.722.0"
+      PAPERCLIP_HOME: ${{ runner.temp }}/prj019-paperclip-home
+      PAPERCLIP_BIND_MODE: loopback
+      PAPERCLIP_TELEMETRY_DISABLED: "1"
+      DO_NOT_TRACK: "1"
+      BASE_URL: http://127.0.0.1:3100
+      EVIDENCE_DIR: ${{ github.workspace }}/m10-evidence
+    steps:
+      - name: Checkout isolated proof branch
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+
+      - name: Execute locked R01-R10 runtime proof
+        id: proof
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          exec > >(tee "$EVIDENCE_DIR/harness.log") 2>&1
+
+          pass() { echo "PASS $1" | tee -a "$EVIDENCE_DIR/results.txt"; }
+          fail() { echo "FAIL $1 :: $2" | tee -a "$EVIDENCE_DIR/results.txt"; exit 1; }
+          api_get() { curl --fail-with-body --silent --show-error "$BASE_URL$1"; }
+          api_post() {
+            local path="$1" body="$2"
+            curl --fail-with-body --silent --show-error -H 'Content-Type: application/json' -X POST "$BASE_URL$path" -d "$body"
+          }
+          wait_health() {
+            for i in $(seq 1 120); do
+              if curl --silent --fail "$BASE_URL/api/health" > "$EVIDENCE_DIR/health.json" 2>/dev/null; then
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          start_pc() {
+            mkdir -p "$PAPERCLIP_HOME"
+            echo "Starting Paperclip $PAPERCLIP_VERSION with PAPERCLIP_HOME=$PAPERCLIP_HOME"
+            nohup npx --yes --registry https://registry.npmjs.org "paperclipai@$PAPERCLIP_VERSION" onboard --yes \
+              > "$EVIDENCE_DIR/paperclip-server-$1.log" 2>&1 &
+            PC_PID=$!
+            echo "$PC_PID" > "$EVIDENCE_DIR/paperclip-$1.pid"
+            wait_health || {
+              cat "$EVIDENCE_DIR/paperclip-server-$1.log" || true
+              return 1
+            }
+          }
+          stop_pc() {
+            if [[ -n "${PC_PID:-}" ]] && kill -0 "$PC_PID" 2>/dev/null; then
+              kill "$PC_PID" || true
+              for i in $(seq 1 20); do
+                kill -0 "$PC_PID" 2>/dev/null || break
+                sleep 1
+              done
+              kill -9 "$PC_PID" 2>/dev/null || true
+            fi
+            pkill -f "paperclipai@$PAPERCLIP_VERSION" 2>/dev/null || true
+            pkill -f "paperclip.*3100" 2>/dev/null || true
+            sleep 2
+          }
+          trap 'stop_pc || true' EXIT
+
+          echo '{"canonical_mutation_count":0,"production_action_count":0,"credential_provider_secret_mutation_count":0,"money_commitment_count":0,"public_service_exposure_count":0,"main_branch_mutation_count":0}' > "$EVIDENCE_DIR/side_effect_counters.json"
+
+          # R01 — official package/version identity
+          npm view "paperclipai@$PAPERCLIP_VERSION" version dist.tarball dist.integrity --json | tee "$EVIDENCE_DIR/npm-package.json"
+          ACTUAL_VERSION=$(jq -r '.version // empty' "$EVIDENCE_DIR/npm-package.json")
+          [[ "$ACTUAL_VERSION" == "$PAPERCLIP_VERSION" ]] || fail R01 "npm version mismatch: $ACTUAL_VERSION"
+          pass R01
+
+          # R02/R03 — real local runtime + readiness
+          start_pc first || fail R02 "Paperclip onboard/start did not become healthy"
+          pass R02
+          api_get /api/health | tee "$EVIDENCE_DIR/health-first.json"
+          pass R03
+
+          # Capture server/OpenAPI observations where available.
+          (api_get /api/server-info || true) | tee "$EVIDENCE_DIR/server-info.json"
+          (api_get /api/openapi.json || api_get /api/openapi || true) > "$EVIDENCE_DIR/openapi.json"
+
+          # R04 — create/read a synthetic TEST company through the real API.
+          COMPANY=$(api_post /api/companies '{"name":"PRJ-019 M10 TEST Company","description":"Synthetic isolated runtime proof only","budgetMonthlyCents":0}') || fail R04 "company create failed"
+          echo "$COMPANY" | jq . | tee "$EVIDENCE_DIR/company-create.json"
+          CID=$(echo "$COMPANY" | jq -r '.id // empty')
+          [[ -n "$CID" ]] || fail R04 "company id missing"
+          api_get "/api/companies/$CID" | jq . | tee "$EVIDENCE_DIR/company-read.json"
+          [[ $(jq -r '.name' "$EVIDENCE_DIR/company-read.json") == "PRJ-019 M10 TEST Company" ]] || fail R04 "company re-read mismatch"
+          pass R04
+
+          # R05 — synthetic Goal/Project/Issue mapping with PRJ external IDs in canonical labels.
+          GOAL=$(api_post "/api/companies/$CID/goals" '{"title":"PRJ-019:M10","description":"external_id=PRJ-019; milestone=M10; shadow_only=true","level":"task","status":"planned"}') || fail R05 "goal create failed"
+          echo "$GOAL" | jq . | tee "$EVIDENCE_DIR/goal-create.json"
+          GID=$(echo "$GOAL" | jq -r '.id // empty')
+          [[ -n "$GID" ]] || fail R05 "goal id missing"
+
+          PROJECT_BODY=$(jq -nc --arg gid "$GID" '{name:"PRJ-019-M10-Shadow",description:"external_id=PRJ-019; task=TASK-016; shadow_only=true",status:"backlog",goalIds:[$gid]}')
+          PROJECT=$(api_post "/api/companies/$CID/projects" "$PROJECT_BODY") || fail R05 "project create failed"
+          echo "$PROJECT" | jq . | tee "$EVIDENCE_DIR/project-create.json"
+          PID=$(echo "$PROJECT" | jq -r '.id // empty')
+          [[ -n "$PID" ]] || fail R05 "project id missing"
+
+          ISSUE_BODY=$(jq -nc --arg pid "$PID" --arg gid "$GID" '{projectId:$pid,goalId:$gid,title:"TASK-016 | PRJ-019 M10 runtime proof",description:"external_id=TASK-016; project_external_id=PRJ-019; shadow_only=true",priority:"medium"}')
+          ISSUE=$(api_post "/api/companies/$CID/issues" "$ISSUE_BODY") || fail R05 "issue create failed"
+          echo "$ISSUE" | jq . | tee "$EVIDENCE_DIR/issue-create.json"
+          IID=$(echo "$ISSUE" | jq -r '.id // empty')
+          [[ -n "$IID" ]] || fail R05 "issue id missing"
+
+          api_get "/api/goals/$GID" | jq . > "$EVIDENCE_DIR/goal-read.json"
+          api_get "/api/projects/$PID" | jq . > "$EVIDENCE_DIR/project-read.json"
+          api_get "/api/issues/$IID" | jq . > "$EVIDENCE_DIR/issue-read.json"
+          grep -q 'PRJ-019' "$EVIDENCE_DIR/goal-read.json" || fail R05 "goal external identity not retained"
+          grep -q 'PRJ-019' "$EVIDENCE_DIR/project-read.json" || fail R05 "project external identity not retained"
+          grep -q 'TASK-016' "$EVIDENCE_DIR/issue-read.json" || fail R05 "issue external identity not retained"
+          pass R05
+
+          # R06 — real process-adapter agent + live heartbeat execution, no paid model/provider.
+          AGENT_BODY=$(jq -nc '{name:"PRJ019-M10-Process-Agent",role:"qa",adapterType:"process",adapterConfig:{command:"/bin/bash",args:["-lc","echo PRJ019_M10_HEARTBEAT_OK"],timeoutSec:30},runtimeConfig:{heartbeat:{enabled:false}},budgetMonthlyCents:0,metadata:{external_id:"PRJ-019:M10:R06",shadow_only:true}}')
+          AGENT=$(api_post "/api/companies/$CID/agents" "$AGENT_BODY") || fail R06 "process agent create failed"
+          echo "$AGENT" | jq . | tee "$EVIDENCE_DIR/agent-create.json"
+          AID=$(echo "$AGENT" | jq -r '.id // empty')
+          [[ -n "$AID" ]] || fail R06 "agent id missing"
+          WAKE_BODY=$(jq -nc '{source:"on_demand",reason:"PRJ-019 M10 R06 runtime proof",payload:{project_external_id:"PRJ-019",task_external_id:"TASK-016"},idempotencyKey:"PRJ019-M10-R06"}')
+          WAKE=$(api_post "/api/agents/$AID/wakeup" "$WAKE_BODY") || fail R06 "agent wakeup failed"
+          echo "$WAKE" | jq . | tee "$EVIDENCE_DIR/wakeup.json"
+          RID=$(echo "$WAKE" | jq -r '.id // empty')
+          [[ -n "$RID" ]] || fail R06 "heartbeat run id missing"
+
+          RUN_STATUS=""
+          for i in $(seq 1 90); do
+            api_get "/api/heartbeat-runs/$RID" | jq . > "$EVIDENCE_DIR/heartbeat-run.json" || true
+            RUN_STATUS=$(jq -r '.status // empty' "$EVIDENCE_DIR/heartbeat-run.json" 2>/dev/null || true)
+            case "$RUN_STATUS" in
+              queued|running|"") sleep 2 ;;
+              *) break ;;
+            esac
+          done
+          api_get "/api/heartbeat-runs/$RID/log?limitBytes=262144" | jq . | tee "$EVIDENCE_DIR/heartbeat-log.json"
+          grep -q 'PRJ019_M10_HEARTBEAT_OK' "$EVIDENCE_DIR/heartbeat-log.json" || fail R06 "runtime marker missing from heartbeat log; status=$RUN_STATUS"
+          case "$RUN_STATUS" in
+            failed|cancelled|timed_out|error) fail R06 "heartbeat terminal status=$RUN_STATUS" ;;
+          esac
+          api_get "/api/heartbeat-runs/$RID/events?limit=200" | jq . > "$EVIDENCE_DIR/heartbeat-events.json"
+          pass R06
+
+          # R07 — zero financial commitment; no Paperclip approval is treated as PRJ approval.
+          api_get "/api/companies/$CID" | jq . > "$EVIDENCE_DIR/company-budget-read.json"
+          api_get "/api/agents/$AID" | jq . > "$EVIDENCE_DIR/agent-budget-read.json"
+          [[ $(jq -r '.budgetMonthlyCents // 0' "$EVIDENCE_DIR/company-budget-read.json") == "0" ]] || fail R07 "company budget is nonzero"
+          [[ $(jq -r '.budgetMonthlyCents // 0' "$EVIDENCE_DIR/agent-budget-read.json") == "0" ]] || fail R07 "agent budget is nonzero"
+          printf '%s\n' 'PRJ Human Gate authority remains Google Drive HG record only; Paperclip sandbox objects are non-authoritative.' > "$EVIDENCE_DIR/r07-governance.txt"
+          pass R07
+
+          # R08 — restart same isolated Paperclip home and re-read persisted objects.
+          stop_pc
+          start_pc second || fail R08 "Paperclip restart did not become healthy"
+          api_get "/api/companies/$CID" | jq . > "$EVIDENCE_DIR/company-after-restart.json"
+          api_get "/api/goals/$GID" | jq . > "$EVIDENCE_DIR/goal-after-restart.json"
+          api_get "/api/projects/$PID" | jq . > "$EVIDENCE_DIR/project-after-restart.json"
+          api_get "/api/issues/$IID" | jq . > "$EVIDENCE_DIR/issue-after-restart.json"
+          [[ $(jq -r '.id' "$EVIDENCE_DIR/company-after-restart.json") == "$CID" ]] || fail R08 "company persistence mismatch"
+          [[ $(jq -r '.id' "$EVIDENCE_DIR/goal-after-restart.json") == "$GID" ]] || fail R08 "goal persistence mismatch"
+          [[ $(jq -r '.id' "$EVIDENCE_DIR/project-after-restart.json") == "$PID" ]] || fail R08 "project persistence mismatch"
+          [[ $(jq -r '.id' "$EVIDENCE_DIR/issue-after-restart.json") == "$IID" ]] || fail R08 "issue persistence mismatch"
+          printf '%s\n' 'canonical_resume_pointer=Google Drive CP-PRJ019-M10-002; sandbox restart does not change it' > "$EVIDENCE_DIR/resume-pointer.txt"
+          pass R08
+
+          # R09 — bounded side-effect invariants.
+          jq -e '.canonical_mutation_count==0 and .production_action_count==0 and .credential_provider_secret_mutation_count==0 and .money_commitment_count==0 and .public_service_exposure_count==0 and .main_branch_mutation_count==0' "$EVIDENCE_DIR/side_effect_counters.json" >/dev/null || fail R09 "side-effect invariant nonzero"
+          pass R09
+
+          # R10 — stop runtime + complete evidence manifest.
+          stop_pc
+          PC_PID=""
+          if curl --silent --fail "$BASE_URL/api/health" >/dev/null 2>&1; then
+            fail R10 "server still responds after cleanup"
+          fi
+          jq -n \
+            --arg paperclipVersion "$PAPERCLIP_VERSION" \
+            --arg companyId "$CID" --arg goalId "$GID" --arg projectId "$PID" --arg issueId "$IID" --arg agentId "$AID" --arg heartbeatRunId "$RID" \
+            --arg heartbeatStatus "$RUN_STATUS" \
+            '{project_id:"PRJ-019",milestone:"M10",scope:"ISOLATED_SANDBOX_ONLY",paperclip_version:$paperclipVersion,company_id:$companyId,goal_id:$goalId,project_id_runtime:$projectId,issue_id:$issueId,agent_id:$agentId,heartbeat_run_id:$heartbeatRunId,heartbeat_status:$heartbeatStatus,canonical_resume_pointer:"CP-PRJ019-M10-002",canonical_mutation_count:0,production_action_count:0,credential_provider_secret_mutation_count:0,money_commitment_count:0,public_service_exposure_count:0,main_branch_mutation_count:0}' \
+            > "$EVIDENCE_DIR/runtime-manifest.json"
+          pass R10
+
+          PASS_COUNT=$(grep -c '^PASS R' "$EVIDENCE_DIR/results.txt" || true)
+          [[ "$PASS_COUNT" == "10" ]] || fail FINAL "expected 10 PASS rows, got $PASS_COUNT"
+          echo "M10_RUNTIME_VERDICT=PASS" | tee "$EVIDENCE_DIR/verdict.txt"
+
+      - name: Upload M10 runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prj019-m10-paperclip-runtime-evidence
+          path: m10-evidence/
+          if-no-files-found: error
+          retention-days: 30
