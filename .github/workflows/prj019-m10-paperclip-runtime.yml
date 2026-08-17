@@ -16,12 +16,10 @@ jobs:
     timeout-minutes: 25
     env:
       PAPERCLIP_VERSION: "2026.722.0"
-      PAPERCLIP_HOME: ${{ runner.temp }}/prj019-paperclip-home
       PAPERCLIP_BIND_MODE: loopback
       PAPERCLIP_TELEMETRY_DISABLED: "1"
       DO_NOT_TRACK: "1"
       BASE_URL: http://127.0.0.1:3100
-      EVIDENCE_DIR: ${{ github.workspace }}/m10-evidence
     steps:
       - name: Checkout isolated proof branch
         uses: actions/checkout@v4
@@ -37,6 +35,8 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          export PAPERCLIP_HOME="$RUNNER_TEMP/prj019-paperclip-home"
+          export EVIDENCE_DIR="$GITHUB_WORKSPACE/m10-evidence"
           mkdir -p "$EVIDENCE_DIR"
           exec > >(tee "$EVIDENCE_DIR/harness.log") 2>&1
 
@@ -85,23 +85,19 @@ jobs:
 
           echo '{"canonical_mutation_count":0,"production_action_count":0,"credential_provider_secret_mutation_count":0,"money_commitment_count":0,"public_service_exposure_count":0,"main_branch_mutation_count":0}' > "$EVIDENCE_DIR/side_effect_counters.json"
 
-          # R01 — official package/version identity
           npm view "paperclipai@$PAPERCLIP_VERSION" version dist.tarball dist.integrity --json | tee "$EVIDENCE_DIR/npm-package.json"
           ACTUAL_VERSION=$(jq -r '.version // empty' "$EVIDENCE_DIR/npm-package.json")
           [[ "$ACTUAL_VERSION" == "$PAPERCLIP_VERSION" ]] || fail R01 "npm version mismatch: $ACTUAL_VERSION"
           pass R01
 
-          # R02/R03 — real local runtime + readiness
           start_pc first || fail R02 "Paperclip onboard/start did not become healthy"
           pass R02
           api_get /api/health | tee "$EVIDENCE_DIR/health-first.json"
           pass R03
 
-          # Capture server/OpenAPI observations where available.
           (api_get /api/server-info || true) | tee "$EVIDENCE_DIR/server-info.json"
           (api_get /api/openapi.json || api_get /api/openapi || true) > "$EVIDENCE_DIR/openapi.json"
 
-          # R04 — create/read a synthetic TEST company through the real API.
           COMPANY=$(api_post /api/companies '{"name":"PRJ-019 M10 TEST Company","description":"Synthetic isolated runtime proof only","budgetMonthlyCents":0}') || fail R04 "company create failed"
           echo "$COMPANY" | jq . | tee "$EVIDENCE_DIR/company-create.json"
           CID=$(echo "$COMPANY" | jq -r '.id // empty')
@@ -110,7 +106,6 @@ jobs:
           [[ $(jq -r '.name' "$EVIDENCE_DIR/company-read.json") == "PRJ-019 M10 TEST Company" ]] || fail R04 "company re-read mismatch"
           pass R04
 
-          # R05 — synthetic Goal/Project/Issue mapping with PRJ external IDs in canonical labels.
           GOAL=$(api_post "/api/companies/$CID/goals" '{"title":"PRJ-019:M10","description":"external_id=PRJ-019; milestone=M10; shadow_only=true","level":"task","status":"planned"}') || fail R05 "goal create failed"
           echo "$GOAL" | jq . | tee "$EVIDENCE_DIR/goal-create.json"
           GID=$(echo "$GOAL" | jq -r '.id // empty')
@@ -136,7 +131,6 @@ jobs:
           grep -q 'TASK-016' "$EVIDENCE_DIR/issue-read.json" || fail R05 "issue external identity not retained"
           pass R05
 
-          # R06 — real process-adapter agent + live heartbeat execution, no paid model/provider.
           AGENT_BODY=$(jq -nc '{name:"PRJ019-M10-Process-Agent",role:"qa",adapterType:"process",adapterConfig:{command:"/bin/bash",args:["-lc","echo PRJ019_M10_HEARTBEAT_OK"],timeoutSec:30},runtimeConfig:{heartbeat:{enabled:false}},budgetMonthlyCents:0,metadata:{external_id:"PRJ-019:M10:R06",shadow_only:true}}')
           AGENT=$(api_post "/api/companies/$CID/agents" "$AGENT_BODY") || fail R06 "process agent create failed"
           echo "$AGENT" | jq . | tee "$EVIDENCE_DIR/agent-create.json"
@@ -165,7 +159,6 @@ jobs:
           api_get "/api/heartbeat-runs/$RID/events?limit=200" | jq . > "$EVIDENCE_DIR/heartbeat-events.json"
           pass R06
 
-          # R07 — zero financial commitment; no Paperclip approval is treated as PRJ approval.
           api_get "/api/companies/$CID" | jq . > "$EVIDENCE_DIR/company-budget-read.json"
           api_get "/api/agents/$AID" | jq . > "$EVIDENCE_DIR/agent-budget-read.json"
           [[ $(jq -r '.budgetMonthlyCents // 0' "$EVIDENCE_DIR/company-budget-read.json") == "0" ]] || fail R07 "company budget is nonzero"
@@ -173,7 +166,6 @@ jobs:
           printf '%s\n' 'PRJ Human Gate authority remains Google Drive HG record only; Paperclip sandbox objects are non-authoritative.' > "$EVIDENCE_DIR/r07-governance.txt"
           pass R07
 
-          # R08 — restart same isolated Paperclip home and re-read persisted objects.
           stop_pc
           start_pc second || fail R08 "Paperclip restart did not become healthy"
           api_get "/api/companies/$CID" | jq . > "$EVIDENCE_DIR/company-after-restart.json"
@@ -187,11 +179,9 @@ jobs:
           printf '%s\n' 'canonical_resume_pointer=Google Drive CP-PRJ019-M10-002; sandbox restart does not change it' > "$EVIDENCE_DIR/resume-pointer.txt"
           pass R08
 
-          # R09 — bounded side-effect invariants.
           jq -e '.canonical_mutation_count==0 and .production_action_count==0 and .credential_provider_secret_mutation_count==0 and .money_commitment_count==0 and .public_service_exposure_count==0 and .main_branch_mutation_count==0' "$EVIDENCE_DIR/side_effect_counters.json" >/dev/null || fail R09 "side-effect invariant nonzero"
           pass R09
 
-          # R10 — stop runtime + complete evidence manifest.
           stop_pc
           PC_PID=""
           if curl --silent --fail "$BASE_URL/api/health" >/dev/null 2>&1; then
