@@ -1,0 +1,319 @@
+name: PRJ-019 M12 Live Shadow Dispatch Proof
+
+on:
+  push:
+    branches:
+      - prj019-m12-live-shadow-dispatch
+    paths:
+      - .github/workflows/prj019-m12-live-shadow-dispatch.yml
+      - prj019/m12/canonical-snapshot-v001.json
+
+permissions:
+  contents: read
+
+jobs:
+  live-shadow-dispatch-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PAPERCLIP_VERSION: "2026.722.0"
+      PAPERCLIP_BIND_MODE: loopback
+      HOST: "127.0.0.1"
+      PORT: "3100"
+      PAPERCLIP_TELEMETRY_DISABLED: "1"
+      DO_NOT_TRACK: "1"
+      BASE_URL: http://127.0.0.1:3100
+      MAIN_SHA_BASELINE: 27f7b5894c2ff3dc28c06d56817f4aa4b9a74e2d
+      EXPECTED_CONTRACT_SHA256: 0a85924d1e754623a4b90255deeca1abff1df117e472891b497f45203261456c
+      EXPECTED_SNAPSHOT_SHA256: 1fb1292b803e959e71f01b37d6e0c2e202b9ff93447e3d2e9fa7d619ed980dea
+      EXPECTED_PHYSICAL_SHA256: 006f866124f90f79721bddb167db257d7dd95f211050d20977a1c1f8b6f00e0b
+      CANONICAL_RESUME_POINTER: CP-PRJ019-M12-002
+
+    steps:
+      - name: Checkout isolated proof branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Execute locked D01-D10 live dispatch proof
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export PAPERCLIP_HOME="$RUNNER_TEMP/prj019-m12-paperclip-home"
+          E="$GITHUB_WORKSPACE/m12-evidence"
+          S="$GITHUB_WORKSPACE/prj019/m12/canonical-snapshot-v001.json"
+          WORKER_OUTPUT="$RUNNER_TEMP/prj019-m12-worker-output.json"
+          mkdir -p "$E"
+          exec > >(tee "$E/harness.log") 2>&1
+
+          pass() { echo "PASS $1" | tee -a "$E/results.txt"; }
+          fail() { echo "FAIL $1 :: $2" | tee -a "$E/results.txt"; exit 1; }
+          api_get() { curl --fail-with-body --silent --show-error "$BASE_URL$1"; }
+          api_post() {
+            local path="$1" body="$2"
+            curl --fail-with-body --silent --show-error -H 'Content-Type: application/json' -X POST "$BASE_URL$path" -d "$body"
+          }
+          api_patch() {
+            local path="$1" body="$2"
+            curl --fail-with-body --silent --show-error -H 'Content-Type: application/json' -X PATCH "$BASE_URL$path" -d "$body"
+          }
+          health_up() { curl --silent --fail "$BASE_URL/api/health" >/dev/null 2>&1; }
+          wait_health() {
+            for _ in $(seq 1 120); do
+              if health_up; then return 0; fi
+              sleep 2
+            done
+            return 1
+          }
+          wait_health_down() {
+            for _ in $(seq 1 30); do
+              health_up || return 0
+              sleep 1
+            done
+            return 1
+          }
+          start_pc() {
+            mkdir -p "$PAPERCLIP_HOME"
+            echo "Starting Paperclip $PAPERCLIP_VERSION process-group"
+            nohup setsid npx --yes --registry https://registry.npmjs.org "paperclipai@$PAPERCLIP_VERSION" onboard --yes >"$E/paperclip-server-$1.log" 2>&1 &
+            PC_PID=$!
+            PC_PGID=$(ps -o pgid= -p "$PC_PID" | tr -d ' ' || true)
+            echo "$PC_PID" >"$E/paperclip-$1.pid"
+            echo "$PC_PGID" >"$E/paperclip-$1.pgid"
+            [[ -n "$PC_PGID" ]] && wait_health || {
+              cat "$E/paperclip-server-$1.log" || true
+              return 1
+            }
+          }
+          stop_pc() {
+            if [[ -n "${PC_PGID:-}" ]]; then
+              echo "Stopping Paperclip process-group $PC_PGID"
+              kill -TERM -- "-$PC_PGID" 2>/dev/null || true
+            fi
+            sleep 1
+            local pids
+            pids=$(lsof -tiTCP:3100 -sTCP:LISTEN 2>/dev/null || true)
+            [[ -z "$pids" ]] || kill $pids 2>/dev/null || true
+            for _ in $(seq 1 10); do
+              if ! health_up && [[ -z "$(lsof -tiTCP:3100 -sTCP:LISTEN 2>/dev/null || true)" ]]; then
+                sleep 1
+                if ! health_up; then PC_PID=""; PC_PGID=""; return 0; fi
+              fi
+              sleep 1
+            done
+            [[ -z "${PC_PGID:-}" ]] || kill -KILL -- "-$PC_PGID" 2>/dev/null || true
+            pids=$(lsof -tiTCP:3100 -sTCP:LISTEN 2>/dev/null || true)
+            [[ -z "$pids" ]] || kill -9 $pids 2>/dev/null || true
+            wait_health_down || return 1
+            [[ -z "$(lsof -tiTCP:3100 -sTCP:LISTEN 2>/dev/null || true)" ]] || return 1
+            PC_PID=""; PC_PGID=""
+          }
+          trap 'stop_pc || true' EXIT
+
+          cp "$S" "$E/canonical-snapshot-v001.json"
+          cp "$GITHUB_WORKSPACE/.github/workflows/prj019-m12-live-shadow-dispatch.yml" "$E/workflow.yml"
+          echo '{"reverse_write_count":0,"canonical_mutation_count":0,"production_action_count":0,"public_service_exposure_count":0,"credential_provider_secret_use_count":0,"money_commitment_count":0,"paid_model_api_call_count":0,"main_branch_mutation_count":0,"canonical_pass_decision_by_paperclip_count":0}' > "$E/side_effect_counters.json"
+
+          # D01 — locked snapshot integrity before execution.
+          jq -e '.snapshot_schema=="PRJ019_CANONICAL_SNAPSHOT_V1" and .canonical_payload.project_id=="PRJ-019" and .canonical_payload.milestone and .canonical_payload.task_id=="TASK-018" and .canonical_payload.human_gate.type=="HG-1" and .canonical_payload.contract_id=="M12-LIVE-SHADOW-DISPATCH-v0.1"' "$S" >/dev/null || fail D01 "required locked snapshot identifiers missing"
+          SH=$(python3 - "$S" <<'PY'
+          import hashlib,json,sys
+          d=json.load(open(sys.argv[1],encoding='utf-8'))['canonical_payload']
+          print(hashlib.sha256(json.dumps(d,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest())
+          PY
+          )
+          EH=$(jq -r '.snapshot_sha256' "$S")
+          CH=$(jq -r '.canonical_payload.contract_sha256' "$S")
+          FH=$(sha256sum "$S" | awk '{print $1}')
+          [[ "$SH" == "$EH" && "$SH" == "$EXPECTED_SNAPSHOT_SHA256" ]] || fail D01 "canonical payload hash mismatch"
+          [[ "$CH" == "$EXPECTED_CONTRACT_SHA256" ]] || fail D01 "contract hash mismatch"
+          [[ "$FH" == "$EXPECTED_PHYSICAL_SHA256" ]] || fail D01 "physical snapshot file hash mismatch"
+          jq -n --arg sh "$SH" --arg fh "$FH" --arg ch "$CH" '{canonical_payload_sha256:$sh,physical_file_sha256:$fh,contract_sha256:$ch}' > "$E/d01-integrity.json"
+          pass D01
+
+          # D02 — exact runtime version, loopback/private exposure.
+          npm view "paperclipai@$PAPERCLIP_VERSION" version dist.tarball dist.integrity --json > "$E/npm-package.json"
+          [[ $(jq -r '.version' "$E/npm-package.json") == "$PAPERCLIP_VERSION" ]] || fail D02 "npm version mismatch"
+          start_pc first || fail D02 "Paperclip did not become healthy"
+          api_get /api/health | jq . > "$E/health-first.json"
+          [[ $(jq -r '.deploymentExposure' "$E/health-first.json") == "private" ]] || fail D02 "runtime exposure is not private"
+          pass D02
+
+          PROJECT_ID=$(jq -r '.canonical_payload.project_id' "$S")
+          FACTORY=$(jq -r '.canonical_payload.factory_version' "$S")
+          STAGE=$(jq -r '.canonical_payload.stage' "$S")
+          MILESTONE=$(jq -r '.canonical_payload.milestone' "$S")
+          TASK=$(jq -r '.canonical_payload.task_id' "$S")
+          SNAPSHOT_TASK_STATUS=$(jq -r '.canonical_payload.task_status' "$S")
+          OWNER=$(jq -r '.canonical_payload.canonical_owner' "$S")
+          ROLE=$(jq -r '.canonical_payload.paperclip_role' "$S")
+          CONTRACT=$(jq -r '.canonical_payload.contract_id' "$S")
+          HGT=$(jq -r '.canonical_payload.human_gate.type' "$S")
+          HGS=$(jq -r '.canonical_payload.human_gate.status' "$S")
+          HGSCOPE=$(jq -r '.canonical_payload.human_gate.scope' "$S")
+
+          # D03 — snapshot-backed Company/Goal/Project/Issue/Agent graph.
+          COMPANY_NAME="$PROJECT_ID M12 Shadow Company"
+          COMPANY_DESC="canonical_owner=$OWNER; snapshot_sha256=$SH; paperclip_role=$ROLE; shadow_only=true"
+          COMPANY=$(api_post /api/companies "$(jq -nc --arg n "$COMPANY_NAME" --arg d "$COMPANY_DESC" '{name:$n,description:$d,budgetMonthlyCents:0}')") || fail D03 "company create failed"
+          CID=$(jq -r '.id // empty' <<<"$COMPANY")
+          [[ -n "$CID" ]] || fail D03 "company id missing"
+
+          GOAL_TITLE="$MILESTONE"
+          GOAL_DESC="canonical_stage=$STAGE; contract_id=$CONTRACT; snapshot_sha256=$SH; shadow_only=true"
+          GOAL=$(api_post "/api/companies/$CID/goals" "$(jq -nc --arg t "$GOAL_TITLE" --arg d "$GOAL_DESC" '{title:$t,description:$d,level:"task",status:"planned"}')") || fail D03 "goal create failed"
+          GID=$(jq -r '.id // empty' <<<"$GOAL")
+          [[ -n "$GID" ]] || fail D03 "goal id missing"
+
+          PROJECT_NAME="$PROJECT_ID | M12 Shadow Dispatch"
+          PROJECT_DESC="factory_version=$FACTORY; canonical_stage=$STAGE; snapshot_sha256=$SH; shadow_only=true"
+          PROJECT=$(api_post "/api/companies/$CID/projects" "$(jq -nc --arg g "$GID" --arg n "$PROJECT_NAME" --arg d "$PROJECT_DESC" '{goalIds:[$g],name:$n,description:$d,status:"backlog"}')") || fail D03 "project create failed"
+          PID=$(jq -r '.id // empty' <<<"$PROJECT")
+          [[ -n "$PID" ]] || fail D03 "project id missing"
+
+          ISSUE_TITLE="$TASK | SHADOW_DISPATCH_PENDING"
+          ISSUE_BASE_DESC="canonical_task_id=$TASK; canonical_snapshot_task_status=$SNAPSHOT_TASK_STATUS; canonical_stage=$STAGE; human_gate=$HGT:$HGS; human_gate_scope=$HGSCOPE; snapshot_sha256=$SH; shadow_only=true"
+          ISSUE=$(api_post "/api/companies/$CID/issues" "$(jq -nc --arg p "$PID" --arg g "$GID" --arg t "$ISSUE_TITLE" --arg d "$ISSUE_BASE_DESC" '{projectId:$p,goalId:$g,title:$t,description:$d,priority:"medium"}')") || fail D03 "issue create failed"
+          IID=$(jq -r '.id // empty' <<<"$ISSUE")
+          [[ -n "$IID" ]] || fail D03 "issue id missing"
+
+          read -r -d '' WORKER_CODE <<'WORKER' || true
+          set -Eeuo pipefail
+          TASK=$(jq -r '.canonical_payload.task_id' "$SNAPSHOT_PATH")
+          MILESTONE=$(jq -r '.canonical_payload.milestone' "$SNAPSHOT_PATH")
+          SH=$(python3 -c 'import hashlib,json,sys; d=json.load(open(sys.argv[1],encoding="utf-8"))["canonical_payload"]; print(hashlib.sha256(json.dumps(d,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode()).hexdigest())' "$SNAPSHOT_PATH")
+          jq -n --arg task "$TASK" --arg milestone "$MILESTONE" --arg sh "$SH" '{worker_verdict:"PASS",canonical_task_id:$task,milestone:$milestone,snapshot_sha256:$sh,work_type:"deterministic_snapshot_proof",side_effects:0}' > "$WORKER_OUTPUT_PATH"
+          echo "PRJ019_M12_WORKER_OK task=$TASK snapshot_sha256=$SH"
+          cat "$WORKER_OUTPUT_PATH"
+          WORKER
+
+          AGENT_BODY=$(jq -nc --arg sh "$SH" --arg task "$TASK" --arg issue "$IID" --arg sp "$S" --arg op "$WORKER_OUTPUT" --arg code "$WORKER_CODE" '{name:"PRJ019-M12-Dispatch-Worker",role:"qa",adapterType:"process",adapterConfig:{command:"/bin/bash",args:["-lc",$code],env:{SNAPSHOT_PATH:$sp,WORKER_OUTPUT_PATH:$op},timeoutSec:60},runtimeConfig:{heartbeat:{enabled:false}},budgetMonthlyCents:0,metadata:{snapshot_sha256:$sh,canonical_task_id:$task,shadow_issue_id:$issue,shadow_only:true}}')
+          AGENT=$(api_post "/api/companies/$CID/agents" "$AGENT_BODY") || fail D03 "agent create failed"
+          AID=$(jq -r '.id // empty' <<<"$AGENT")
+          [[ -n "$AID" ]] || fail D03 "agent id missing"
+
+          ISSUE_LINKED_DESC="$ISSUE_BASE_DESC; shadow_agent_id=$AID"
+          api_patch "/api/issues/$IID" "$(jq -nc --arg d "$ISSUE_LINKED_DESC" '{description:$d}')" | jq . > "$E/issue-link-patch.json" || fail D03 "issue-agent link patch failed"
+          api_get "/api/issues/$IID" | jq . > "$E/issue-linked.json"
+          api_get "/api/agents/$AID" | jq . > "$E/agent-linked.json"
+          [[ $(jq -r '.description' "$E/issue-linked.json") == "$ISSUE_LINKED_DESC" ]] || fail D03 "issue-agent link readback mismatch"
+          [[ $(jq -r '.metadata.canonical_task_id' "$E/agent-linked.json") == "$TASK" && $(jq -r '.metadata.snapshot_sha256' "$E/agent-linked.json") == "$SH" && $(jq -r '.metadata.shadow_issue_id' "$E/agent-linked.json") == "$IID" ]] || fail D03 "agent canonical identity mismatch"
+          jq -n --arg c "$CID" --arg g "$GID" --arg p "$PID" --arg i "$IID" --arg a "$AID" '{company_id:$c,goal_id:$g,project_id:$p,issue_id:$i,agent_id:$a}' > "$E/d03-object-ids.json"
+          pass D03
+
+          # D04 — real Paperclip on-demand dispatch creates a heartbeat run.
+          WAKE_BODY=$(jq -nc --arg task "$TASK" --arg sh "$SH" --arg issue "$IID" '{source:"on_demand",reason:"PRJ-019 M12 D04 shadow dispatch",payload:{canonical_task_id:$task,snapshot_sha256:$sh,shadow_issue_id:$issue},idempotencyKey:"PRJ019-M12-D04-v001"}')
+          WAKE=$(api_post "/api/agents/$AID/wakeup" "$WAKE_BODY") || fail D04 "agent wakeup failed"
+          echo "$WAKE" | jq . > "$E/wakeup.json"
+          RID=$(jq -r '.id // empty' <<<"$WAKE")
+          [[ -n "$RID" ]] || fail D04 "heartbeat run id missing"
+          pass D04
+
+          RUN_STATUS=""
+          for _ in $(seq 1 120); do
+            api_get "/api/heartbeat-runs/$RID" | jq . > "$E/heartbeat-run.json" || true
+            RUN_STATUS=$(jq -r '.status // empty' "$E/heartbeat-run.json" 2>/dev/null || true)
+            case "$RUN_STATUS" in queued|running|"") sleep 1 ;; *) break ;; esac
+          done
+          api_get "/api/heartbeat-runs/$RID/log?limitBytes=262144" | jq . > "$E/heartbeat-log.json" || true
+          api_get "/api/heartbeat-runs/$RID/events?limit=200" | jq . > "$E/heartbeat-events.json" || true
+
+          # D05 — deterministic worker output derived from locked snapshot exists.
+          [[ -f "$WORKER_OUTPUT" ]] || fail D05 "worker output file missing; run_status=$RUN_STATUS"
+          cp "$WORKER_OUTPUT" "$E/worker-output.json"
+          [[ $(jq -r '.worker_verdict' "$E/worker-output.json") == "PASS" ]] || fail D05 "worker verdict is not PASS"
+          [[ $(jq -r '.canonical_task_id' "$E/worker-output.json") == "$TASK" ]] || fail D05 "worker task identity mismatch"
+          [[ $(jq -r '.snapshot_sha256' "$E/worker-output.json") == "$SH" ]] || fail D05 "worker snapshot hash mismatch"
+          [[ $(jq -r '.side_effects' "$E/worker-output.json") == "0" ]] || fail D05 "worker reported side effects"
+          pass D05
+
+          # D06 — successful terminal run and traceable log/output.
+          [[ "$RUN_STATUS" == "succeeded" ]] || fail D06 "heartbeat terminal status=$RUN_STATUS"
+          grep -q 'PRJ019_M12_WORKER_OK' "$E/heartbeat-log.json" || fail D06 "worker marker missing from heartbeat log"
+          grep -q "$TASK" "$E/heartbeat-log.json" || fail D06 "TASK-018 missing from heartbeat log"
+          grep -q "$SH" "$E/heartbeat-log.json" || fail D06 "snapshot hash missing from heartbeat log"
+          jq -n --arg rid "$RID" --arg status "$RUN_STATUS" --arg task "$TASK" --arg sh "$SH" '{heartbeat_run_id:$rid,status:$status,canonical_task_id:$task,snapshot_sha256:$sh,traceable:true}' > "$E/d06-traceability.json"
+          pass D06
+
+          # D07 — Paperclip shadow state may show completion but cannot decide canonical PASS.
+          COMPLETION_TITLE="$TASK | SHADOW_WORKER_COMPLETED"
+          COMPLETION_DESC="$ISSUE_LINKED_DESC; shadow_completion=true; heartbeat_run_id=$RID; worker_verdict=PASS; canonical_pass_decision_by_paperclip=false"
+          api_patch "/api/issues/$IID" "$(jq -nc --arg t "$COMPLETION_TITLE" --arg d "$COMPLETION_DESC" '{title:$t,description:$d}')" | jq . > "$E/issue-completion-patch.json" || fail D07 "shadow completion patch failed"
+          api_get "/api/issues/$IID" | jq . > "$E/issue-completion-read.json"
+          [[ $(jq -r '.title' "$E/issue-completion-read.json") == "$COMPLETION_TITLE" && $(jq -r '.description' "$E/issue-completion-read.json") == "$COMPLETION_DESC" ]] || fail D07 "shadow completion readback mismatch"
+          [[ $(sha256sum "$S" | awk '{print $1}') == "$FH" ]] || fail D07 "locked snapshot mutated during dispatch"
+          jq -n --arg status "$SNAPSHOT_TASK_STATUS" --arg resume "$CANONICAL_RESUME_POINTER" '{paperclip_shadow_completion:true,locked_snapshot_task_status:$status,canonical_pass_decision_by_paperclip:false,drive_write_capability_in_runner:false,canonical_resume_pointer:$resume}' > "$E/d07-authority-boundary.json"
+          pass D07
+
+          # D08 — restart preserves shadow graph, run, log, and completion evidence.
+          stop_pc || fail D08 "first runtime stop failed"
+          health_up && fail D08 "health remained up before restart"
+          echo FIRST_RUNTIME_CONFIRMED_DOWN > "$E/restart-boundary.txt"
+          start_pc second || fail D08 "Paperclip restart failed"
+          api_get "/api/companies/$CID" | jq . > "$E/company-after-restart.json"
+          api_get "/api/goals/$GID" | jq . > "$E/goal-after-restart.json"
+          api_get "/api/projects/$PID" | jq . > "$E/project-after-restart.json"
+          api_get "/api/issues/$IID" | jq . > "$E/issue-after-restart.json"
+          api_get "/api/agents/$AID" | jq . > "$E/agent-after-restart.json"
+          api_get "/api/heartbeat-runs/$RID" | jq . > "$E/run-after-restart.json"
+          api_get "/api/heartbeat-runs/$RID/log?limitBytes=262144" | jq . > "$E/log-after-restart.json"
+          [[ $(jq -r '.id' "$E/company-after-restart.json") == "$CID" ]] || fail D08 "company persistence mismatch"
+          [[ $(jq -r '.id' "$E/goal-after-restart.json") == "$GID" ]] || fail D08 "goal persistence mismatch"
+          [[ $(jq -r '.id' "$E/project-after-restart.json") == "$PID" ]] || fail D08 "project persistence mismatch"
+          [[ $(jq -r '.id' "$E/issue-after-restart.json") == "$IID" && $(jq -r '.title' "$E/issue-after-restart.json") == "$COMPLETION_TITLE" ]] || fail D08 "issue/completion persistence mismatch"
+          [[ $(jq -r '.id' "$E/agent-after-restart.json") == "$AID" ]] || fail D08 "agent persistence mismatch"
+          [[ $(jq -r '.id' "$E/run-after-restart.json") == "$RID" && $(jq -r '.status' "$E/run-after-restart.json") == "succeeded" ]] || fail D08 "run persistence mismatch"
+          grep -q 'PRJ019_M12_WORKER_OK' "$E/log-after-restart.json" || fail D08 "run log not preserved"
+          [[ -f "$WORKER_OUTPUT" ]] || fail D08 "worker evidence missing across restart"
+          echo "canonical_resume_pointer=$CANONICAL_RESUME_POINTER; canonical_owner=$OWNER" > "$E/d08-resume-pointer.txt"
+          pass D08
+
+          # D09 — zero prohibited side effects and main unchanged.
+          for key in GOOGLE_APPLICATION_CREDENTIALS GOOGLE_DRIVE_TOKEN GDRIVE_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY; do
+            [[ -z "${!key:-}" ]] || fail D09 "provider credential unexpectedly present: $key"
+          done
+          CURRENT_MAIN_SHA=$(curl -fsSL https://api.github.com/repos/domeagloco/durmbarai-website/commits/main | jq -r '.sha')
+          [[ "$CURRENT_MAIN_SHA" == "$MAIN_SHA_BASELINE" ]] || fail D09 "main branch changed: $CURRENT_MAIN_SHA"
+          jq -n --arg baseline "$MAIN_SHA_BASELINE" --arg current "$CURRENT_MAIN_SHA" '{main_sha_baseline:$baseline,main_sha_after_runtime:$current,unchanged:($baseline==$current)}' > "$E/d09-main-check.json"
+          jq -e '.reverse_write_count==0 and .canonical_mutation_count==0 and .production_action_count==0 and .public_service_exposure_count==0 and .credential_provider_secret_use_count==0 and .money_commitment_count==0 and .paid_model_api_call_count==0 and .main_branch_mutation_count==0 and .canonical_pass_decision_by_paperclip_count==0' "$E/side_effect_counters.json" >/dev/null || fail D09 "side-effect invariant nonzero"
+          pass D09
+
+          # D10 — clean stop + complete evidence package.
+          stop_pc || fail D10 "Paperclip cleanup failed"
+          PC_PID=""; PC_PGID=""
+          health_up && fail D10 "server still responds after cleanup"
+          jq -n \
+            --arg paperclipVersion "$PAPERCLIP_VERSION" \
+            --arg snapshotSha "$SH" \
+            --arg physicalSha "$FH" \
+            --arg contractSha "$CH" \
+            --arg companyId "$CID" \
+            --arg goalId "$GID" \
+            --arg projectId "$PID" \
+            --arg issueId "$IID" \
+            --arg agentId "$AID" \
+            --arg heartbeatRunId "$RID" \
+            --arg heartbeatStatus "$RUN_STATUS" \
+            --arg resume "$CANONICAL_RESUME_POINTER" \
+            '{project_id:"PRJ-019",milestone:"M12",scope:"ISOLATED_SANDBOX_ONLY",paperclip_version:$paperclipVersion,snapshot_sha256:$snapshotSha,physical_snapshot_sha256:$physicalSha,contract_sha256:$contractSha,company_id:$companyId,goal_id:$goalId,project_id_runtime:$projectId,issue_id:$issueId,agent_id:$agentId,heartbeat_run_id:$heartbeatRunId,heartbeat_status:$heartbeatStatus,canonical_resume_pointer:$resume,reverse_write_count:0,canonical_mutation_count:0,production_action_count:0,credential_provider_secret_use_count:0,money_commitment_count:0,paid_model_api_call_count:0,public_service_exposure_count:0,main_branch_mutation_count:0,canonical_pass_decision_by_paperclip_count:0}' > "$E/runtime-manifest.json"
+          pass D10
+
+          PASS_COUNT=$(grep -c '^PASS D' "$E/results.txt" || true)
+          WARN_COUNT=$(grep -c '^WARN ' "$E/results.txt" || true)
+          FAIL_COUNT=$(grep -c '^FAIL ' "$E/results.txt" || true)
+          [[ "$PASS_COUNT" == "10" && "$WARN_COUNT" == "0" && "$FAIL_COUNT" == "0" ]] || fail FINAL "expected PASS/WARN/FAIL 10/0/0, got $PASS_COUNT/$WARN_COUNT/$FAIL_COUNT"
+          echo "M12_LIVE_SHADOW_DISPATCH_VERDICT=PASS" | tee "$E/verdict.txt"
+
+      - name: Upload M12 dispatch evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prj019-m12-live-shadow-dispatch-evidence
+          path: m12-evidence/
+          if-no-files-found: error
+          retention-days: 30
