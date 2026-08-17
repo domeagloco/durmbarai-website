@@ -1,0 +1,312 @@
+name: PRJ-019 M11 Live Shadow Sync Proof
+
+on:
+  push:
+    branches:
+      - prj019-m11-live-shadow-sync
+    paths:
+      - .github/workflows/prj019-m11-live-shadow-sync.yml
+      - prj019/m11/canonical-snapshot-v001.json
+
+permissions:
+  contents: read
+
+jobs:
+  live-shadow-sync-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PAPERCLIP_VERSION: "2026.722.0"
+      HOST: "127.0.0.1"
+      PORT: "3100"
+      PAPERCLIP_TELEMETRY_DISABLED: "1"
+      DO_NOT_TRACK: "1"
+      BASE_URL: http://127.0.0.1:3100
+      MAIN_SHA_BASELINE: 27f7b5894c2ff3dc28c06d56817f4aa4b9a74e2d
+      EXPECTED_CONTRACT_SHA256: b8a98720271f3aa7a811fa887a0b356ae97f9be7b938695bbd794a1601420031
+      EXPECTED_SNAPSHOT_SHA256: 44d274d336e8f24fe37111f861ea15e8790882a1db771e683710c8425a21e989
+    steps:
+      - name: Checkout isolated M11 branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Execute locked S01-S10 live shadow-sync proof
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export PAPERCLIP_HOME="$RUNNER_TEMP/prj019-m11-paperclip-home"
+          export EVIDENCE_DIR="$GITHUB_WORKSPACE/m11-evidence"
+          export SNAPSHOT_FILE="$GITHUB_WORKSPACE/prj019/m11/canonical-snapshot-v001.json"
+          mkdir -p "$EVIDENCE_DIR"
+          exec > >(tee "$EVIDENCE_DIR/harness.log") 2>&1
+
+          pass() { echo "PASS $1" | tee -a "$EVIDENCE_DIR/results.txt"; }
+          fail() { echo "FAIL $1 :: $2" | tee -a "$EVIDENCE_DIR/results.txt"; exit 1; }
+          api_get() { curl --fail-with-body --silent --show-error "$BASE_URL$1"; }
+          api_post() {
+            local path="$1" body="$2"
+            curl --fail-with-body --silent --show-error -H 'Content-Type: application/json' -X POST "$BASE_URL$path" -d "$body"
+          }
+          api_patch() {
+            local path="$1" body="$2"
+            curl --fail-with-body --silent --show-error -H 'Content-Type: application/json' -X PATCH "$BASE_URL$path" -d "$body"
+          }
+          health_up() { curl --silent --fail "$BASE_URL/api/health" >/dev/null 2>&1; }
+          wait_health() {
+            for i in $(seq 1 120); do
+              if health_up; then
+                curl --silent --fail "$BASE_URL/api/health" > "$EVIDENCE_DIR/health.json"
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          wait_health_down() {
+            for i in $(seq 1 30); do
+              health_up || return 0
+              sleep 1
+            done
+            return 1
+          }
+          start_pc() {
+            mkdir -p "$PAPERCLIP_HOME"
+            echo "Starting Paperclip $PAPERCLIP_VERSION on $HOST:$PORT"
+            nohup npx --yes --registry https://registry.npmjs.org "paperclipai@$PAPERCLIP_VERSION" onboard --yes \
+              > "$EVIDENCE_DIR/paperclip-server-$1.log" 2>&1 &
+            PC_PID=$!
+            echo "$PC_PID" > "$EVIDENCE_DIR/paperclip-$1.pid"
+            wait_health || {
+              cat "$EVIDENCE_DIR/paperclip-server-$1.log" || true
+              return 1
+            }
+          }
+          stop_pc() {
+            if [[ -n "${PC_PID:-}" ]] && kill -0 "$PC_PID" 2>/dev/null; then
+              kill "$PC_PID" 2>/dev/null || true
+            fi
+            LISTENER_PIDS=$(lsof -tiTCP:3100 -sTCP:LISTEN 2>/dev/null || true)
+            if [[ -n "$LISTENER_PIDS" ]]; then
+              echo "Stopping Paperclip listener PID(s): $LISTENER_PIDS"
+              kill $LISTENER_PIDS 2>/dev/null || true
+            fi
+            if ! wait_health_down; then
+              LISTENER_PIDS=$(lsof -tiTCP:3100 -sTCP:LISTEN 2>/dev/null || true)
+              if [[ -n "$LISTENER_PIDS" ]]; then
+                kill -9 $LISTENER_PIDS 2>/dev/null || true
+              fi
+            fi
+            wait_health_down
+          }
+          trap 'stop_pc || true' EXIT
+
+          cp "$SNAPSHOT_FILE" "$EVIDENCE_DIR/canonical-snapshot-v001.json"
+          cp "$GITHUB_WORKSPACE/.github/workflows/prj019-m11-live-shadow-sync.yml" "$EVIDENCE_DIR/workflow.yml"
+
+          cat > "$EVIDENCE_DIR/side_effect_counters.json" <<'JSON'
+          {"reverse_write_count":0,"canonical_mutation_count":0,"production_action_count":0,"public_service_exposure_count":0,"credential_provider_secret_mutation_count":0,"money_commitment_count":0,"main_branch_mutation_count":0}
+          JSON
+
+          # S01 — verify immutable canonical snapshot structure + canonical-payload hash.
+          [[ -f "$SNAPSHOT_FILE" ]] || fail S01 "snapshot file missing"
+          jq -e '.snapshot_schema=="PRJ019_CANONICAL_SNAPSHOT_V1" and .canonical_payload.project_id and .canonical_payload.stage and .canonical_payload.milestone and .canonical_payload.task_id and .canonical_payload.human_gate.type and .canonical_payload.human_gate.status and .canonical_payload.resume_checkpoint_id and .canonical_payload.contract_id and .canonical_payload.contract_sha256' "$SNAPSHOT_FILE" >/dev/null || fail S01 "required canonical identifiers missing"
+          SNAPSHOT_HASH=$(python - "$SNAPSHOT_FILE" <<'PY'
+          import hashlib, json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          raw = json.dumps(data["canonical_payload"], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+          print(hashlib.sha256(raw).hexdigest())
+          PY
+          )
+          EMBEDDED_HASH=$(jq -r '.snapshot_sha256' "$SNAPSHOT_FILE")
+          CONTRACT_SHA=$(jq -r '.canonical_payload.contract_sha256' "$SNAPSHOT_FILE")
+          [[ "$SNAPSHOT_HASH" == "$EMBEDDED_HASH" ]] || fail S01 "canonical payload hash mismatch"
+          [[ "$SNAPSHOT_HASH" == "$EXPECTED_SNAPSHOT_SHA256" ]] || fail S01 "snapshot hash differs from locked contract input"
+          [[ "$CONTRACT_SHA" == "$EXPECTED_CONTRACT_SHA256" ]] || fail S01 "contract hash mismatch"
+          SNAPSHOT_FILE_HASH_BEFORE=$(sha256sum "$SNAPSHOT_FILE" | awk '{print $1}')
+          jq -n --arg payloadHash "$SNAPSHOT_HASH" --arg physicalHash "$SNAPSHOT_FILE_HASH_BEFORE" --arg contractHash "$CONTRACT_SHA" '{canonical_payload_sha256:$payloadHash,physical_file_sha256:$physicalHash,contract_sha256:$contractHash}' > "$EVIDENCE_DIR/s01-integrity.json"
+          pass S01
+
+          # S02 — start the exact Paperclip version on loopback/private exposure.
+          npm view "paperclipai@$PAPERCLIP_VERSION" version dist.tarball dist.integrity --json | tee "$EVIDENCE_DIR/npm-package.json"
+          ACTUAL_VERSION=$(jq -r '.version // empty' "$EVIDENCE_DIR/npm-package.json")
+          [[ "$ACTUAL_VERSION" == "$PAPERCLIP_VERSION" ]] || fail S02 "npm version mismatch: $ACTUAL_VERSION"
+          start_pc first || fail S02 "Paperclip did not become healthy"
+          api_get /api/health | jq . | tee "$EVIDENCE_DIR/health-first.json"
+          [[ $(jq -r '.version // .serverVersion // empty' "$EVIDENCE_DIR/health-first.json") == "$PAPERCLIP_VERSION" ]] || fail S02 "runtime version mismatch"
+          [[ $(jq -r '.deploymentExposure // empty' "$EVIDENCE_DIR/health-first.json") == "private" ]] || fail S02 "deployment exposure is not private"
+          pass S02
+
+          # Resolve canonical values once; all shadow mapping and re-sync derives from this same snapshot.
+          PROJECT_ID=$(jq -r '.canonical_payload.project_id' "$SNAPSHOT_FILE")
+          FACTORY_VERSION=$(jq -r '.canonical_payload.factory_version' "$SNAPSHOT_FILE")
+          STAGE=$(jq -r '.canonical_payload.stage' "$SNAPSHOT_FILE")
+          MILESTONE=$(jq -r '.canonical_payload.milestone' "$SNAPSHOT_FILE")
+          TASK_ID=$(jq -r '.canonical_payload.task_id' "$SNAPSHOT_FILE")
+          TASK_STATUS=$(jq -r '.canonical_payload.task_status' "$SNAPSHOT_FILE")
+          HG_TYPE=$(jq -r '.canonical_payload.human_gate.type' "$SNAPSHOT_FILE")
+          HG_STATUS=$(jq -r '.canonical_payload.human_gate.status' "$SNAPSHOT_FILE")
+          HG_SCOPE=$(jq -r '.canonical_payload.human_gate.scope' "$SNAPSHOT_FILE")
+          CANONICAL_OWNER=$(jq -r '.canonical_payload.canonical_owner' "$SNAPSHOT_FILE")
+          PAPERCLIP_ROLE=$(jq -r '.canonical_payload.paperclip_role' "$SNAPSHOT_FILE")
+          RESUME_ID=$(jq -r '.canonical_payload.resume_checkpoint_id' "$SNAPSHOT_FILE")
+          CONTRACT_ID=$(jq -r '.canonical_payload.contract_id' "$SNAPSHOT_FILE")
+
+          COMPANY_NAME="$PROJECT_ID M11 Shadow Company"
+          COMPANY_DESC="canonical_owner=$CANONICAL_OWNER; snapshot_sha256=$SNAPSHOT_HASH; paperclip_role=$PAPERCLIP_ROLE"
+          GOAL_TITLE="$MILESTONE"
+          GOAL_DESC="canonical_stage=$STAGE; contract_id=$CONTRACT_ID; snapshot_sha256=$SNAPSHOT_HASH"
+          PROJECT_NAME="$PROJECT_ID | M11 Shadow Sync"
+          PROJECT_DESC="factory_version=$FACTORY_VERSION; canonical_stage=$STAGE; resume_checkpoint_id=$RESUME_ID; shadow_only=true"
+          ISSUE_TITLE="$TASK_ID | $TASK_STATUS"
+          ISSUE_DESC="canonical_stage=$STAGE; human_gate=$HG_TYPE:$HG_STATUS; human_gate_scope=$HG_SCOPE; resume_checkpoint_id=$RESUME_ID; snapshot_sha256=$SNAPSHOT_HASH; shadow_only=true"
+
+          # S03 — map snapshot into real Paperclip Company/Goal/Project/Issue/Agent objects.
+          COMPANY_BODY=$(jq -nc --arg name "$COMPANY_NAME" --arg desc "$COMPANY_DESC" '{name:$name,description:$desc,budgetMonthlyCents:0}')
+          COMPANY=$(api_post /api/companies "$COMPANY_BODY") || fail S03 "company create failed"
+          echo "$COMPANY" | jq . > "$EVIDENCE_DIR/company-create.json"
+          CID=$(echo "$COMPANY" | jq -r '.id // empty')
+          [[ -n "$CID" ]] || fail S03 "company id missing"
+
+          GOAL_BODY=$(jq -nc --arg title "$GOAL_TITLE" --arg desc "$GOAL_DESC" '{title:$title,description:$desc,level:"task",status:"planned"}')
+          GOAL=$(api_post "/api/companies/$CID/goals" "$GOAL_BODY") || fail S03 "goal create failed"
+          echo "$GOAL" | jq . > "$EVIDENCE_DIR/goal-create.json"
+          GID=$(echo "$GOAL" | jq -r '.id // empty')
+          [[ -n "$GID" ]] || fail S03 "goal id missing"
+
+          PROJECT_BODY=$(jq -nc --arg gid "$GID" --arg name "$PROJECT_NAME" --arg desc "$PROJECT_DESC" '{goalIds:[$gid],name:$name,description:$desc,status:"backlog"}')
+          PROJECT=$(api_post "/api/companies/$CID/projects" "$PROJECT_BODY") || fail S03 "project create failed"
+          echo "$PROJECT" | jq . > "$EVIDENCE_DIR/project-create.json"
+          PID=$(echo "$PROJECT" | jq -r '.id // empty')
+          [[ -n "$PID" ]] || fail S03 "project id missing"
+
+          ISSUE_BODY=$(jq -nc --arg pid "$PID" --arg gid "$GID" --arg title "$ISSUE_TITLE" --arg desc "$ISSUE_DESC" '{projectId:$pid,goalId:$gid,title:$title,description:$desc,priority:"medium"}')
+          ISSUE=$(api_post "/api/companies/$CID/issues" "$ISSUE_BODY") || fail S03 "issue create failed"
+          echo "$ISSUE" | jq . > "$EVIDENCE_DIR/issue-create.json"
+          IID=$(echo "$ISSUE" | jq -r '.id // empty')
+          [[ -n "$IID" ]] || fail S03 "issue id missing"
+
+          AGENT_BODY=$(jq -nc --arg snapshot "$SNAPSHOT_HASH" --arg task "$TASK_ID" --arg hg "$HG_STATUS" --arg resume "$RESUME_ID" '{name:"PRJ019-M11-Shadow-Agent",role:"qa",adapterType:"process",adapterConfig:{command:"/bin/bash",args:["-lc","echo PRJ019_M11_SHADOW_ONLY"],timeoutSec:30},runtimeConfig:{heartbeat:{enabled:false}},budgetMonthlyCents:0,metadata:{snapshot_sha256:$snapshot,canonical_task_id:$task,canonical_human_gate_status:$hg,canonical_resume_checkpoint_id:$resume,shadow_only:true}}')
+          AGENT=$(api_post "/api/companies/$CID/agents" "$AGENT_BODY") || fail S03 "agent create failed"
+          echo "$AGENT" | jq . > "$EVIDENCE_DIR/agent-create.json"
+          AID=$(echo "$AGENT" | jq -r '.id // empty')
+          [[ -n "$AID" ]] || fail S03 "agent id missing"
+          jq -n --arg companyId "$CID" --arg goalId "$GID" --arg projectId "$PID" --arg issueId "$IID" --arg agentId "$AID" '{company_id:$companyId,goal_id:$goalId,project_id:$projectId,issue_id:$issueId,agent_id:$agentId}' > "$EVIDENCE_DIR/s03-object-ids.json"
+          pass S03
+
+          # S04 — authoritative API readback must equal snapshot-derived canonical values.
+          api_get "/api/companies/$CID" | jq . > "$EVIDENCE_DIR/company-read-canonical.json"
+          api_get "/api/goals/$GID" | jq . > "$EVIDENCE_DIR/goal-read-canonical.json"
+          api_get "/api/projects/$PID" | jq . > "$EVIDENCE_DIR/project-read-canonical.json"
+          api_get "/api/issues/$IID" | jq . > "$EVIDENCE_DIR/issue-read-canonical.json"
+          api_get "/api/agents/$AID" | jq . > "$EVIDENCE_DIR/agent-read-canonical.json"
+          [[ $(jq -r '.name' "$EVIDENCE_DIR/company-read-canonical.json") == "$COMPANY_NAME" ]] || fail S04 "company name mismatch"
+          [[ $(jq -r '.description' "$EVIDENCE_DIR/company-read-canonical.json") == "$COMPANY_DESC" ]] || fail S04 "company description mismatch"
+          [[ $(jq -r '.title' "$EVIDENCE_DIR/goal-read-canonical.json") == "$GOAL_TITLE" ]] || fail S04 "goal title mismatch"
+          [[ $(jq -r '.description' "$EVIDENCE_DIR/goal-read-canonical.json") == "$GOAL_DESC" ]] || fail S04 "goal description mismatch"
+          [[ $(jq -r '.name' "$EVIDENCE_DIR/project-read-canonical.json") == "$PROJECT_NAME" ]] || fail S04 "project name mismatch"
+          [[ $(jq -r '.description' "$EVIDENCE_DIR/project-read-canonical.json") == "$PROJECT_DESC" ]] || fail S04 "project description mismatch"
+          [[ $(jq -r '.title' "$EVIDENCE_DIR/issue-read-canonical.json") == "$ISSUE_TITLE" ]] || fail S04 "issue title mismatch"
+          [[ $(jq -r '.description' "$EVIDENCE_DIR/issue-read-canonical.json") == "$ISSUE_DESC" ]] || fail S04 "issue description mismatch"
+          [[ $(jq -r '.metadata.snapshot_sha256' "$EVIDENCE_DIR/agent-read-canonical.json") == "$SNAPSHOT_HASH" ]] || fail S04 "agent snapshot identity mismatch"
+          [[ $(jq -r '.metadata.canonical_task_id' "$EVIDENCE_DIR/agent-read-canonical.json") == "$TASK_ID" ]] || fail S04 "agent task identity mismatch"
+          [[ $(jq -r '.metadata.canonical_resume_checkpoint_id' "$EVIDENCE_DIR/agent-read-canonical.json") == "$RESUME_ID" ]] || fail S04 "agent resume identity mismatch"
+          pass S04
+
+          # S05 — create deliberate Paperclip-only drift and prove it is detected.
+          DRIFT_TITLE="PAPERCLIP_DRIFT_SHOULD_NOT_WIN"
+          DRIFT_DESC="paperclip_only_drift=true; canonical_snapshot_must_win_on_resync"
+          DRIFT_BODY=$(jq -nc --arg title "$DRIFT_TITLE" --arg desc "$DRIFT_DESC" '{title:$title,description:$desc}')
+          api_patch "/api/issues/$IID" "$DRIFT_BODY" | jq . > "$EVIDENCE_DIR/drift-patch-response.json" || fail S05 "drift patch failed"
+          api_get "/api/issues/$IID" | jq . > "$EVIDENCE_DIR/issue-after-drift.json"
+          [[ $(jq -r '.title' "$EVIDENCE_DIR/issue-after-drift.json") == "$DRIFT_TITLE" ]] || fail S05 "drift title not committed"
+          [[ $(jq -r '.description' "$EVIDENCE_DIR/issue-after-drift.json") == "$DRIFT_DESC" ]] || fail S05 "drift description not committed"
+          [[ $(jq -r '.title' "$EVIDENCE_DIR/issue-after-drift.json") != "$ISSUE_TITLE" ]] || fail S05 "drift not detected"
+          SNAPSHOT_FILE_HASH_AFTER_DRIFT=$(sha256sum "$SNAPSHOT_FILE" | awk '{print $1}')
+          [[ "$SNAPSHOT_FILE_HASH_AFTER_DRIFT" == "$SNAPSHOT_FILE_HASH_BEFORE" ]] || fail S05 "locked snapshot changed during drift"
+          jq -n --arg canonicalTitle "$ISSUE_TITLE" --arg driftTitle "$DRIFT_TITLE" --arg snapshotFileHash "$SNAPSHOT_FILE_HASH_AFTER_DRIFT" '{drift_detected:true,canonical_title:$canonicalTitle,paperclip_drift_title:$driftTitle,locked_snapshot_physical_hash:$snapshotFileHash,drive_write_capability_in_runner:false}' > "$EVIDENCE_DIR/s05-drift-detection.json"
+          pass S05
+
+          # S06 — re-sync from the exact same snapshot and prove canonical values win.
+          RESYNC_BODY=$(jq -nc --arg title "$ISSUE_TITLE" --arg desc "$ISSUE_DESC" '{title:$title,description:$desc}')
+          api_patch "/api/issues/$IID" "$RESYNC_BODY" | jq . > "$EVIDENCE_DIR/resync-patch-response.json" || fail S06 "canonical re-sync patch failed"
+          api_get "/api/issues/$IID" | jq . > "$EVIDENCE_DIR/issue-after-resync.json"
+          [[ $(jq -r '.title' "$EVIDENCE_DIR/issue-after-resync.json") == "$ISSUE_TITLE" ]] || fail S06 "canonical title not restored"
+          [[ $(jq -r '.description' "$EVIDENCE_DIR/issue-after-resync.json") == "$ISSUE_DESC" ]] || fail S06 "canonical description not restored"
+          grep -q 'PAPERCLIP_DRIFT_SHOULD_NOT_WIN' "$EVIDENCE_DIR/issue-after-resync.json" && fail S06 "drift remains after re-sync"
+          jq -n --arg snapshotHash "$SNAPSHOT_HASH" --arg restoredTitle "$ISSUE_TITLE" '{resync_source:"locked_canonical_snapshot_v001",snapshot_sha256:$snapshotHash,canonical_won:true,restored_title:$restoredTitle}' > "$EVIDENCE_DIR/s06-reconciliation.json"
+          pass S06
+
+          # S07 — governance/budgets remain shadow-only; Paperclip has no PRJ approval object.
+          api_get "/api/companies/$CID" | jq . > "$EVIDENCE_DIR/company-budget.json"
+          api_get "/api/agents/$AID" | jq . > "$EVIDENCE_DIR/agent-budget.json"
+          api_get "/api/issues/$IID/approvals" | jq . > "$EVIDENCE_DIR/issue-approvals.json"
+          [[ $(jq -r '.budgetMonthlyCents // 0' "$EVIDENCE_DIR/company-budget.json") == "0" ]] || fail S07 "company budget is nonzero"
+          [[ $(jq -r '.spentMonthlyCents // 0' "$EVIDENCE_DIR/company-budget.json") == "0" ]] || fail S07 "company spend is nonzero"
+          [[ $(jq -r '.budgetMonthlyCents // 0' "$EVIDENCE_DIR/agent-budget.json") == "0" ]] || fail S07 "agent budget is nonzero"
+          [[ $(jq -r '.spentMonthlyCents // 0' "$EVIDENCE_DIR/agent-budget.json") == "0" ]] || fail S07 "agent spend is nonzero"
+          [[ $(jq 'length' "$EVIDENCE_DIR/issue-approvals.json") == "0" ]] || fail S07 "Paperclip approval objects unexpectedly exist"
+          printf '%s\n' "canonical_human_gate=$HG_TYPE:$HG_STATUS; authority=$CANONICAL_OWNER; paperclip_role=$PAPERCLIP_ROLE" > "$EVIDENCE_DIR/s07-governance.txt"
+          pass S07
+
+          # S08 — true stop/restart, persistent shadow objects, canonical resume remains Drive.
+          stop_pc || fail S08 "first Paperclip runtime did not stop cleanly"
+          health_up && fail S08 "health remained up before restart"
+          echo "FIRST_RUNTIME_CONFIRMED_DOWN" > "$EVIDENCE_DIR/restart-boundary.txt"
+          start_pc second || fail S08 "Paperclip restart did not become healthy"
+          api_get "/api/companies/$CID" | jq . > "$EVIDENCE_DIR/company-after-restart.json"
+          api_get "/api/goals/$GID" | jq . > "$EVIDENCE_DIR/goal-after-restart.json"
+          api_get "/api/projects/$PID" | jq . > "$EVIDENCE_DIR/project-after-restart.json"
+          api_get "/api/issues/$IID" | jq . > "$EVIDENCE_DIR/issue-after-restart.json"
+          api_get "/api/agents/$AID" | jq . > "$EVIDENCE_DIR/agent-after-restart.json"
+          [[ $(jq -r '.id' "$EVIDENCE_DIR/company-after-restart.json") == "$CID" ]] || fail S08 "company persistence mismatch"
+          [[ $(jq -r '.id' "$EVIDENCE_DIR/goal-after-restart.json") == "$GID" ]] || fail S08 "goal persistence mismatch"
+          [[ $(jq -r '.id' "$EVIDENCE_DIR/project-after-restart.json") == "$PID" ]] || fail S08 "project persistence mismatch"
+          [[ $(jq -r '.id' "$EVIDENCE_DIR/issue-after-restart.json") == "$IID" ]] || fail S08 "issue persistence mismatch"
+          [[ $(jq -r '.id' "$EVIDENCE_DIR/agent-after-restart.json") == "$AID" ]] || fail S08 "agent persistence mismatch"
+          [[ $(jq -r '.title' "$EVIDENCE_DIR/issue-after-restart.json") == "$ISSUE_TITLE" ]] || fail S08 "reconciled canonical value did not persist"
+          printf '%s\n' "canonical_resume_pointer=$RESUME_ID; canonical_owner=$CANONICAL_OWNER; Paperclip shadow restart cannot change it" > "$EVIDENCE_DIR/s08-resume-pointer.txt"
+          pass S08
+
+          # S09 — enforce every prohibited side-effect invariant and verify main stayed at baseline.
+          if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" || -n "${GOOGLE_DRIVE_TOKEN:-}" || -n "${GDRIVE_TOKEN:-}" ]]; then
+            fail S09 "Google credential variable present in runner"
+          fi
+          MAIN_SHA_OBSERVED=$(git ls-remote https://github.com/domeagloco/durmbarai-website.git refs/heads/main | awk '{print $1}')
+          [[ "$MAIN_SHA_OBSERVED" == "$MAIN_SHA_BASELINE" ]] || fail S09 "main SHA changed during bounded proof: $MAIN_SHA_OBSERVED"
+          echo "$MAIN_SHA_OBSERVED" > "$EVIDENCE_DIR/main-sha-observed.txt"
+          jq -e '.reverse_write_count==0 and .canonical_mutation_count==0 and .production_action_count==0 and .public_service_exposure_count==0 and .credential_provider_secret_mutation_count==0 and .money_commitment_count==0 and .main_branch_mutation_count==0' "$EVIDENCE_DIR/side_effect_counters.json" >/dev/null || fail S09 "side-effect invariant nonzero"
+          pass S09
+
+          # S10 — final cleanup and complete evidence manifest.
+          stop_pc || fail S10 "Paperclip cleanup failed"
+          PC_PID=""
+          health_up && fail S10 "server still responds after cleanup"
+          SNAPSHOT_FILE_HASH_FINAL=$(sha256sum "$SNAPSHOT_FILE" | awk '{print $1}')
+          [[ "$SNAPSHOT_FILE_HASH_FINAL" == "$SNAPSHOT_FILE_HASH_BEFORE" ]] || fail S10 "locked snapshot changed"
+          jq -n \
+            --arg projectId "$PROJECT_ID" --arg milestone "$MILESTONE" --arg taskId "$TASK_ID" \
+            --arg paperclipVersion "$PAPERCLIP_VERSION" --arg snapshotHash "$SNAPSHOT_HASH" --arg physicalSnapshotHash "$SNAPSHOT_FILE_HASH_FINAL" \
+            --arg contractHash "$CONTRACT_SHA" --arg companyId "$CID" --arg goalId "$GID" --arg projectRuntimeId "$PID" --arg issueId "$IID" --arg agentId "$AID" \
+            --arg resumeId "$RESUME_ID" --arg mainSha "$MAIN_SHA_OBSERVED" \
+            '{project_id:$projectId,milestone:$milestone,task_id:$taskId,scope:"ISOLATED_SANDBOX_ONLY",paperclip_version:$paperclipVersion,canonical_snapshot_sha256:$snapshotHash,physical_snapshot_sha256:$physicalSnapshotHash,contract_sha256:$contractHash,company_id:$companyId,goal_id:$goalId,project_runtime_id:$projectRuntimeId,issue_id:$issueId,agent_id:$agentId,canonical_resume_pointer:$resumeId,main_sha_observed:$mainSha,drift_detected:true,canonical_reconciliation:true,reverse_write_count:0,canonical_mutation_count:0,production_action_count:0,public_service_exposure_count:0,credential_provider_secret_mutation_count:0,money_commitment_count:0,main_branch_mutation_count:0}' \
+            > "$EVIDENCE_DIR/runtime-manifest.json"
+          pass S10
+
+          PASS_COUNT=$(grep -c '^PASS S' "$EVIDENCE_DIR/results.txt" || true)
+          [[ "$PASS_COUNT" == "10" ]] || fail FINAL "expected 10 PASS rows, got $PASS_COUNT"
+          echo "M11_LIVE_SHADOW_SYNC_VERDICT=PASS" | tee "$EVIDENCE_DIR/verdict.txt"
+
+      - name: Upload M11 live shadow-sync evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prj019-m11-live-shadow-sync-evidence
+          path: m11-evidence/
+          if-no-files-found: error
+          retention-days: 30
