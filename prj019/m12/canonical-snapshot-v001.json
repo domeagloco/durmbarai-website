@@ -1,0 +1,40 @@
+{
+  "snapshot_schema": "PRJ019_CANONICAL_SNAPSHOT_V1",
+  "snapshot_sha256": "1fb1292b803e959e71f01b37d6e0c2e202b9ff93447e3d2e9fa7d619ed980dea",
+  "canonical_payload": {
+    "project_id": "PRJ-019",
+    "factory_version": "Factory Kernel v1.0 — M0/M1/M2/M3/M4/M5/M6/M7/M8/M9/M10/M11 PASS",
+    "stage": "M12 — READY_FOR_HUMAN_GATE (HG-1)",
+    "milestone": "M12 — Paperclip Live Shadow Dispatch & Worker Execution",
+    "task_id": "TASK-018",
+    "task_status": "รออนุมัติ HG-1",
+    "human_gate": {
+      "type": "HG-1",
+      "status": "PENDING",
+      "scope": "M12 external GitHub isolated branch/workflow/run D01-D10 only"
+    },
+    "canonical_owner": "PRJ-019 Google Drive",
+    "paperclip_role": "shadow_non_authoritative_orchestrator",
+    "contract_id": "M12-LIVE-SHADOW-DISPATCH-v0.1",
+    "contract_sha256": "0a85924d1e754623a4b90255deeca1abff1df117e472891b497f45203261456c",
+    "contract_url": "https://docs.google.com/document/d/15Rep0c2wK8quTzNcGicssKixVezZRLCXPb9xvjmTmvg/edit",
+    "last_pass": {
+      "milestone": "M11 — Live Canonical Snapshot → Paperclip Shadow Sync",
+      "run_id": "RUN-015",
+      "result": "PASS",
+      "pass_count": 10,
+      "warn_count": 0,
+      "fail_count": 0,
+      "evidence_ids": [
+        "EV-CORE-M11",
+        "EV-CORE-M11-AUDIT",
+        "EV-CORE-M11-RAW",
+        "EV-HG-M11-001"
+      ]
+    },
+    "source_of_truth_priority": "Evidence/Test Result > Control Center > Knowledge Base > Master Tracker > Chat/Memory",
+    "autopilot_rule": "PASS → continue | fixable FAIL → repair/retest | HARD BLOCKER → escalate",
+    "generated_by_role": "State Custodian",
+    "chat_memory_required": false
+  }
+}
