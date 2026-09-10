@@ -1,1 +1,0 @@
-Dermbar CRM preview assets only.
